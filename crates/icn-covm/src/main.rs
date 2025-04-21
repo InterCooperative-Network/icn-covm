@@ -16,6 +16,7 @@ use icn_covm::storage::implementations::in_memory::InMemoryStorage;
 use icn_covm::storage::traits::StorageBackend;
 use icn_covm::storage::utils::now_with_default;
 use icn_covm::vm::{MemoryScope, StackOps, VMError, VM};
+use icn_covm::{execute_program_from_path, ExecutionResult, StorageBackendType, VMEngineError, VMOptions};
 
 use clap::{Arg, ArgAction, Command};
 use log::{debug, error, info, warn};
@@ -43,6 +44,9 @@ enum AppError {
 
     #[error("Federation error: {0}")]
     Federation(String),
+
+    #[error("VM Engine error: {0}")]
+    VMEngine(#[from] VMEngineError),
 
     #[error("{0}")]
     Other(String),
@@ -603,19 +607,66 @@ async fn run_with_federation(
 
     // Now run the program if specified
     if program_path != "program.dsl" || Path::new(program_path).exists() {
-        run_program(
-            program_path,
-            verbose,
-            use_stdlib,
-            parameters,
+        // Convert traditional storage_backend string to StorageBackendType
+        let backend_type = match storage_backend {
+            "memory" => StorageBackendType::Memory,
+            "file" => StorageBackendType::File(storage_path.to_string()),
+            _ => StorageBackendType::Memory,
+        };
+        
+        // Setup options using the new VMOptions struct
+        let options = VMOptions {
+            storage_backend: backend_type,
+            identity_context: None, // Will use default in the library
+            enable_federation: true, // Enable federation since we're running with federation
             use_bytecode,
-            storage_backend,
-            storage_path,
-            simulate,
-            trace,
-            explain,
+            debug_mode: verbose,
+            simulation_mode: simulate,
+            trace_execution: trace,
+            explain_operations: explain,
             verbose_storage_trace,
-        )?;
+            namespace: "demo".to_string(),
+            parameters: parameters.clone(),
+            use_stdlib,
+        };
+        
+        // Use the new library function to execute the program
+        let result = execute_program_from_path(program_path, options)?;
+        
+        // Handle the result and print information according to the verbose flag
+        if verbose {
+            if result.success {
+                println!("-----------------------------------");
+                println!("Program execution completed successfully in {} ms", result.execution_time_ms);
+                
+                // Print final stack state
+                if let Some(stack) = &result.stack {
+                    println!("Final stack: {:?}", stack);
+                }
+                
+                // Print final memory state
+                if let Some(memory) = &result.memory {
+                    println!("Final memory:");
+                    for (key, value) in memory {
+                        println!("  {}: {}", key, value);
+                    }
+                    if memory.is_empty() {
+                        println!("  (empty)");
+                    }
+                }
+            } else {
+                println!("-----------------------------------");
+                println!("Program execution failed: {}", result.error.unwrap_or_else(|| "Unknown error".to_string()));
+            }
+        } else if !result.success {
+            // Always print errors, even in non-verbose mode
+            eprintln!("Error: {}", result.error.unwrap_or_else(|| "Unknown error".to_string()));
+        }
+        
+        // Return error if execution failed
+        if !result.success {
+            return Err(AppError::Other(result.error.unwrap_or_else(|| "Unknown error".to_string())));
+        }
     } else {
         info!("No program specified, running in network-only mode");
 
@@ -641,165 +692,68 @@ fn run_program(
     explain: bool,
     verbose_storage_trace: bool,
 ) -> Result<(), AppError> {
-    let path = Path::new(program_path);
-
-    // Check if file exists
-    if !path.exists() {
-        return Err(format!("Program file not found: {}", program_path).into());
-    }
-
-    // Parse operations based on file extension
-    let ops = if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-        match extension.to_lowercase().as_str() {
-            "dsl" => {
-                if verbose {
-                    println!("Parsing DSL program from {}", program_path);
-                }
-                let program_source = fs::read_to_string(path)?;
-
-                // Check if we should include the standard library
-                if verbose && use_stdlib {
-                    println!("Including standard library functions");
-                }
-
-                if use_stdlib {
-                    parse_dsl_with_stdlib(&program_source)?
-                } else {
-                    let (ops, _lifecycle) = parse_dsl(&program_source)?;
-                    ops
-                }
-            }
-            "json" => {
-                if verbose {
-                    println!("Parsing JSON program from {}", program_path);
-                }
-                let program_json = fs::read_to_string(path)?;
-                serde_json::from_str(&program_json)?
-            }
-            _ => return Err(format!("Unsupported file extension: {}", extension).into()),
-        }
-    } else {
-        return Err("File has no extension".into());
+    // Convert traditional storage_backend string to StorageBackendType
+    let backend_type = match storage_backend {
+        "memory" => StorageBackendType::Memory,
+        "file" => StorageBackendType::File(storage_path.to_string()),
+        _ => StorageBackendType::Memory,
     };
-
+    
+    // Setup options using the new VMOptions struct
+    let options = VMOptions {
+        storage_backend: backend_type,
+        identity_context: None, // Will use default in the library
+        enable_federation: false,
+        use_bytecode,
+        debug_mode: verbose,
+        simulation_mode: simulate,
+        trace_execution: trace,
+        explain_operations: explain,
+        verbose_storage_trace,
+        namespace: "demo".to_string(),
+        parameters: parameters.clone(),
+        use_stdlib,
+    };
+    
+    // Use the new library function to execute the program
+    let result = execute_program_from_path(program_path, options)?;
+    
+    // Handle the result and print information according to the verbose flag
     if verbose {
-        println!("Program loaded with {} operations", ops.len());
-    }
-
-    // Print execution mode information
-    if verbose || simulate || trace || explain {
-        if simulate {
-            println!("Running in SIMULATION mode (no persistent storage changes)");
-        }
-        if trace {
-            println!("Tracing enabled (will show operations and stack state)");
-        }
-        if explain {
-            println!("Explanation enabled (will describe each operation)");
-        }
-    }
-
-    // Setup auth context and storage based on selected backend
-    let auth_context = create_demo_auth_context()?;
-
-    // Select the appropriate storage backend
-    let storage = create_storage_backend(storage_backend, storage_path)?;
-
-    if use_bytecode {
-        // Bytecode execution with FileStorage
-        let mut compiler = BytecodeCompiler::new();
-        let program = compiler.compile(&ops);
-
-        if verbose {
-            println!("Compiled bytecode program:\n{}", program.dump());
-        }
-
-        // Create bytecode interpreter with proper auth context and storage
-        let mut vm: VM<InMemoryStorage> = VM::new()
-            .set_simulation_mode(simulate)
-            .set_tracing(trace)
-            .set_explanation(explain)
-            .set_verbose_storage_trace(verbose_storage_trace);
-
-        vm.set_auth_context(auth_context);
-        vm.set_namespace("demo");
-        vm.set_storage_backend(storage);
-
-        let mut interpreter = BytecodeInterpreter::new(vm, program);
-
-        // Set parameters
-        interpreter
-            .get_vm_mut()
-            .set_parameters(parameters.clone())?;
-
-        // Execute
-        let start = Instant::now();
-        let result = interpreter.execute();
-        let duration = start.elapsed();
-
-        if verbose {
-            println!("Execution completed in {:?}", duration);
-        }
-
-        if let Err(err) = result {
-            return Err(err.into());
-        }
-
-        if verbose {
-            println!("Final stack: {:?}", interpreter.get_vm().get_stack());
-
-            let memory_map = interpreter.get_vm().get_memory_map();
-            for (key, value) in memory_map {
-                println!("  {}: {}", key, value);
-            }
-            if interpreter.get_vm().get_memory_map().is_empty() {
-                println!("  (empty)");
-            }
-        }
-    } else {
-        // AST execution with FileStorage
-        let mut vm: VM<InMemoryStorage> = VM::new();
-
-        // Set the new flags
-        vm.set_simulation_mode(simulate);
-        vm.set_tracing(trace);
-        vm.set_explanation(explain);
-        vm.set_verbose_storage_trace(verbose_storage_trace);
-
-        vm.set_auth_context(auth_context);
-        vm.set_namespace("demo");
-        vm.set_storage_backend(storage);
-
-        // Set parameters
-        vm.set_parameters(parameters)?;
-
-        if verbose {
-            println!("Executing program in AST interpreter mode...");
+        if result.success {
             println!("-----------------------------------");
-        }
-
-        vm.execute(&ops)?;
-
-        if verbose {
-            println!("-----------------------------------");
-            println!("Program execution completed successfully");
-
+            println!("Program execution completed successfully in {} ms", result.execution_time_ms);
+            
             // Print final stack state
-            println!("Final stack: {:?}", vm.get_stack());
-
+            if let Some(stack) = &result.stack {
+                println!("Final stack: {:?}", stack);
+            }
+            
             // Print final memory state
-            println!("Final memory:");
-            let memory_map = vm.get_memory_map();
-            for (key, value) in memory_map {
-                println!("  {}: {}", key, value);
+            if let Some(memory) = &result.memory {
+                println!("Final memory:");
+                for (key, value) in memory {
+                    println!("  {}: {}", key, value);
+                }
+                if memory.is_empty() {
+                    println!("  (empty)");
+                }
             }
-            if vm.get_memory_map().is_empty() {
-                println!("  (empty)");
-            }
+        } else {
+            println!("-----------------------------------");
+            println!("Program execution failed: {}", result.error.unwrap_or_else(|| "Unknown error".to_string()));
         }
+    } else if !result.success {
+        // Always print errors, even in non-verbose mode
+        eprintln!("Error: {}", result.error.unwrap_or_else(|| "Unknown error".to_string()));
     }
-
-    Ok(())
+    
+    // Return Ok if success, otherwise convert error to AppError
+    if result.success {
+        Ok(())
+    } else {
+        Err(AppError::Other(result.error.unwrap_or_else(|| "Unknown error".to_string())))
+    }
 }
 
 /// Helper to create the appropriate storage backend
@@ -839,32 +793,15 @@ fn initialize_storage<T: StorageBackend>(
 
 // Create a demo authentication context for storage operations
 fn create_demo_auth_context() -> Result<AuthContext, AppError> {
-    // Create identity
-    let user_did = Identity::new("demo-user".to_string(), None, "user".to_string(), None)
-        .map_err(|e| AppError::Other(format!("Failed to create identity: {}", e)))?;
-    let mut auth_context = AuthContext::new(&user_did.did);
-    auth_context.register_identity(user_did);
-    Ok(auth_context)
+    Ok(icn_covm::create_default_auth_context(Some("demo-user"), Some("user")))
 }
 
 // Helper function to create a demo auth context and initialize storage
 fn setup_storage_for_demo() -> (AuthContext, InMemoryStorage) {
-    let auth = create_demo_auth_context().unwrap();
-
-    // Create storage backend
-    let mut storage = InMemoryStorage::new();
-
-    // Create user account
-    if let Err(e) = storage.create_account(Some(&auth), &auth.user_id(), 1024 * 1024) {
-        println!("Warning: Failed to create account: {:?}", e);
-    }
-
-    // Create namespace
-    if let Err(e) = storage.create_namespace(Some(&auth), "demo", 1024 * 1024, None) {
-        println!("Warning: Failed to create namespace: {:?}", e);
-    }
-
-    (auth, storage)
+    let auth_context = icn_covm::create_default_auth_context(Some("demo-user"), Some("user"));
+    let storage = InMemoryStorage::new();
+    
+    (auth_context, storage)
 }
 
 fn run_benchmark(
@@ -875,116 +812,122 @@ fn run_benchmark(
     _storage_backend: &str,
     _storage_path: &str,
 ) -> Result<(), AppError> {
-    let path = Path::new(program_path);
+    println!("Running benchmark comparison between AST and bytecode execution...");
 
-    // Check if file exists
+    // First, parse the program
+    let path = Path::new(program_path);
     if !path.exists() {
         return Err(format!("Program file not found: {}", program_path).into());
     }
 
-    // Parse operations based on file extension
-    let ops = if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-        match extension.to_lowercase().as_str() {
-            "dsl" => {
-                println!("Parsing DSL program from {}", program_path);
-                let program_source = fs::read_to_string(path)?;
-
-                if use_stdlib {
-                    parse_dsl_with_stdlib(&program_source)?
-                } else {
-                    let (ops, _lifecycle) = parse_dsl(&program_source)?;
-                    ops
-                }
-            }
-            "json" => {
-                println!("Parsing JSON program from {}", program_path);
-                let program_json = fs::read_to_string(path)?;
-                serde_json::from_str(&program_json)?
-            }
-            _ => return Err(format!("Unsupported file extension: {}", extension).into()),
-        }
-    } else {
-        return Err("File has no extension".into());
-    };
-
-    println!("Program loaded with {} operations", ops.len());
-    println!("\nBenchmarking execution modes...");
-
-    // Run AST interpreter
     println!("\n1. Running AST interpreter...");
-
-    let mut vm: VM<InMemoryStorage> = VM::new();
-
-    // Set up auth context and namespace
-    let auth_context = setup_storage_for_demo().0;
-    vm.set_auth_context(auth_context.clone());
-    vm.set_namespace("demo");
-
-    vm.set_parameters(parameters.clone())?;
-
+    
+    // Run AST execution
+    let ast_options = VMOptions {
+        storage_backend: StorageBackendType::Memory,
+        identity_context: None,
+        enable_federation: false,
+        use_bytecode: false,
+        debug_mode: false,
+        simulation_mode: true, // Use simulation mode for benchmarks
+        trace_execution: false,
+        explain_operations: false,
+        verbose_storage_trace: false,
+        namespace: "demo".to_string(),
+        parameters: parameters.clone(),
+        use_stdlib,
+    };
+    
     let ast_start = Instant::now();
-    vm.execute(&ops)?;
+    let ast_result = execute_program_from_path(program_path, ast_options)?;
     let ast_duration = ast_start.elapsed();
-
+    
     println!("AST execution time: {:?}", ast_duration);
+    println!("AST operations executed: {}", ast_result.operations_executed);
 
-    // Run bytecode compilation and execution
+    // Run bytecode execution
     println!("\n2. Running bytecode compiler and interpreter...");
-
-    let compiler_start = Instant::now();
-    let mut compiler = BytecodeCompiler::new();
-    let program = compiler.compile(&ops);
-    let compiler_duration = compiler_start.elapsed();
-
-    println!("Bytecode compilation time: {:?}", compiler_duration);
-    println!("Bytecode size: {} instructions", program.instructions.len());
-
-    let mut vm: VM<InMemoryStorage> = VM::new();
-    vm.set_auth_context(auth_context);
-    vm.set_namespace("demo");
-
-    let mut interpreter = BytecodeInterpreter::new(VM::<InMemoryStorage>::new(), program);
-    interpreter.get_vm_mut().set_parameters(parameters)?;
-
+    
+    let bytecode_options = VMOptions {
+        storage_backend: StorageBackendType::Memory,
+        identity_context: None,
+        enable_federation: false,
+        use_bytecode: true,
+        debug_mode: false,
+        simulation_mode: true, // Use simulation mode for benchmarks
+        trace_execution: false,
+        explain_operations: false,
+        verbose_storage_trace: false,
+        namespace: "demo".to_string(),
+        parameters: parameters.clone(),
+        use_stdlib,
+    };
+    
     let bytecode_start = Instant::now();
-    interpreter.execute()?;
+    let bytecode_result = execute_program_from_path(program_path, bytecode_options)?;
     let bytecode_duration = bytecode_start.elapsed();
-
+    
     println!("Bytecode execution time: {:?}", bytecode_duration);
+    println!("Bytecode operations executed: {}", bytecode_result.operations_executed);
 
-    // Calculate speedup
-    let total_bytecode_time = compiler_duration + bytecode_duration;
-    println!(
-        "\nTotal bytecode time (compilation + execution): {:?}",
-        total_bytecode_time
-    );
-
+    // Calculate speedup or slowdown
     if ast_duration > bytecode_duration {
         let speedup = ast_duration.as_secs_f64() / bytecode_duration.as_secs_f64();
         println!(
-            "Bytecode execution is {:.2}x faster than AST interpretation",
+            "\nBytecode execution is {:.2}x faster than AST interpretation",
             speedup
         );
     } else {
         let slowdown = bytecode_duration.as_secs_f64() / ast_duration.as_secs_f64();
         println!(
-            "Bytecode execution is {:.2}x slower than AST interpretation",
+            "\nBytecode execution is {:.2}x slower than AST interpretation",
             slowdown
         );
     }
 
-    if ast_duration > total_bytecode_time {
-        let speedup = ast_duration.as_secs_f64() / total_bytecode_time.as_secs_f64();
-        println!(
-            "Bytecode (including compilation) is {:.2}x faster than AST interpretation",
-            speedup
-        );
-    } else {
-        let slowdown = total_bytecode_time.as_secs_f64() / ast_duration.as_secs_f64();
-        println!(
-            "Bytecode (including compilation) is {:.2}x slower than AST interpretation",
-            slowdown
-        );
+    // Verify results match
+    if let (Some(ast_stack), Some(bytecode_stack)) = (&ast_result.stack, &bytecode_result.stack) {
+        if ast_stack == bytecode_stack {
+            println!("\nResults match: Both executions produced the same stack state");
+        } else {
+            println!("\nWARNING: Results do not match!");
+            println!("AST stack: {:?}", ast_stack);
+            println!("Bytecode stack: {:?}", bytecode_stack);
+        }
+    }
+
+    if let (Some(ast_memory), Some(bytecode_memory)) = (&ast_result.memory, &bytecode_result.memory) {
+        if ast_memory == bytecode_memory {
+            println!("Results match: Both executions produced the same memory state");
+        } else {
+            println!("WARNING: Memory states do not match!");
+            // Show only differing memory entries
+            let mut differences = false;
+            for (key, ast_value) in ast_memory {
+                if let Some(bytecode_value) = bytecode_memory.get(key) {
+                    if ast_value != bytecode_value {
+                        differences = true;
+                        println!("Key '{}' differs:", key);
+                        println!("  AST: {}", ast_value);
+                        println!("  Bytecode: {}", bytecode_value);
+                    }
+                } else {
+                    differences = true;
+                    println!("Key '{}' exists in AST but not in bytecode", key);
+                }
+            }
+            
+            for key in bytecode_memory.keys() {
+                if !ast_memory.contains_key(key) {
+                    differences = true;
+                    println!("Key '{}' exists in bytecode but not in AST", key);
+                }
+            }
+            
+            if !differences {
+                println!("No memory differences found despite unequal comparison");
+            }
+        }
     }
 
     Ok(())
@@ -1459,12 +1402,7 @@ fn get_value_command(
 
 /// Creates an admin auth context for inspection purposes
 fn create_admin_auth_context() -> Result<AuthContext, AppError> {
-    // Create identity with "admin" seed
-    let admin_did = Identity::new("admin".to_string(), None, "admin".to_string(), None)
-        .map_err(|e| AppError::Other(format!("Failed to create admin identity: {}", e)))?;
-    let mut auth_context = AuthContext::new(&admin_did.did);
-    auth_context.register_identity(admin_did);
-    Ok(auth_context)
+    Ok(icn_covm::create_default_auth_context(Some("admin-user"), Some("admin")))
 }
 
 /// Handle the broadcast-proposal federation command
