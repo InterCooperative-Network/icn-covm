@@ -252,7 +252,7 @@ impl<S: storage::traits::StorageBackend + Send + Sync + Clone + Debug + 'static>
             if options.debug_mode {
                 println!("Running in simulation mode - no persistent changes will be made");
             }
-            vm.begin_transaction();
+            vm.set_simulation_mode(true);
         }
         
         if options.trace_execution {
@@ -263,11 +263,22 @@ impl<S: storage::traits::StorageBackend + Send + Sync + Clone + Debug + 'static>
         }
         
         if options.explain_operations {
-            vm.set_explain_operations(true);
+            vm.set_explanation(true);
         }
         
         if options.verbose_storage_trace {
-            vm.set_storage_tracing(true);
+            vm.set_verbose_storage_trace(true);
+        }
+        
+        // Initialize federation if enabled
+        #[cfg(feature = "federation")]
+        if options.enable_federation {
+            if options.debug_mode {
+                println!("Federation support enabled");
+            }
+            
+            // In a real implementation, we would initialize the network node here
+            // based on federation-specific options
         }
         
         Ok(vm)
@@ -368,6 +379,200 @@ pub fn create_default_auth_context(id_name: Option<&str>, role: Option<&str>) ->
     auth.add_role_to_identity(id_name, "global", role);
     
     auth
+}
+
+/// Result of program execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionResult {
+    /// Whether the execution completed successfully
+    pub success: bool,
+    
+    /// Error message if execution failed
+    pub error: Option<String>,
+    
+    /// Execution time in milliseconds
+    pub execution_time_ms: u64,
+    
+    /// Final stack state (if successful)
+    pub stack: Option<Vec<TypedValue>>,
+    
+    /// Final memory state (if successful)
+    pub memory: Option<HashMap<String, TypedValue>>,
+    
+    /// Number of operations executed
+    pub operations_executed: usize,
+
+    /// The VM instance that executed the program (not serialized)
+    #[serde(skip)]
+    pub vm: Option<vm::VM<storage::implementations::in_memory::InMemoryStorage>>,
+}
+
+/// Execute a program from a file path
+pub fn execute_program_from_path(path: &str, options: VMOptions) -> Result<ExecutionResult, VMEngineError> {
+    let path_obj = std::path::Path::new(path);
+    
+    // Read the program file
+    let program_source = match std::fs::read_to_string(path_obj) {
+        Ok(src) => src,
+        Err(e) => return Err(VMEngineError::IO(e.to_string())),
+    };
+    
+    // Record start time for performance measurement
+    let start_time = std::time::Instant::now();
+    
+    // Parse the program based on file extension
+    let result = if path.ends_with(".json") {
+        // Parse JSON directly to operations list
+        match serde_json::from_str::<Vec<Op>>(&program_source) {
+            Ok(ops) => {
+                // Create VM and execute operations
+                let mut vm = vm::VM::create_with_options(&options)?;
+                
+                if let Some(params) = &options.parameters {
+                    vm.set_parameters(params.clone())?;
+                }
+                
+                // Execute the program
+                match vm.execute(&ops) {
+                    Ok(()) => {
+                        // Get the execution results
+                        let stack = vm.get_stack();
+                        let memory = vm.get_memory_map();
+                        let execution_time = start_time.elapsed().as_millis() as u64;
+                        
+                        // Return successful result with VM instance
+                        Ok(ExecutionResult {
+                            success: true,
+                            error: None,
+                            execution_time_ms: execution_time,
+                            stack: Some(stack),
+                            memory: Some(memory),
+                            operations_executed: ops.len(),
+                            vm: Some(vm),
+                        })
+                    }
+                    Err(e) => {
+                        // Return error result
+                        Ok(ExecutionResult {
+                            success: false,
+                            error: Some(e.to_string()),
+                            execution_time_ms: start_time.elapsed().as_millis() as u64,
+                            stack: None,
+                            memory: None,
+                            operations_executed: 0,
+                            vm: None,
+                        })
+                    }
+                }
+            }
+            Err(e) => Err(VMEngineError::Json(e.to_string())),
+        }
+    } else {
+        // Assume DSL format for other file extensions
+        let ops = if options.use_stdlib {
+            match compiler::parse_dsl_with_stdlib(&program_source) {
+                Ok(ops) => ops,
+                Err(e) => return Err(VMEngineError::Compiler(e.to_string())),
+            }
+        } else {
+            match compiler::parse_dsl(&program_source) {
+                Ok((ops, _)) => ops,
+                Err(e) => return Err(VMEngineError::Compiler(e.to_string())),
+            }
+        };
+        
+        if options.use_bytecode {
+            // Compile to bytecode and execute
+            let mut compiler = bytecode::BytecodeCompiler::new();
+            let program = compiler.compile(&ops);
+            
+            // Create VM and execute bytecode
+            let mut vm = vm::VM::create_with_options(&options)?;
+            
+            if let Some(params) = &options.parameters {
+                vm.set_parameters(params.clone())?;
+            }
+            
+            // Create interpreter with VM and program
+            let mut interpreter = bytecode::BytecodeInterpreter::new(vm, program);
+            
+            // Execute the program
+            match interpreter.execute() {
+                Ok(()) => {
+                    // Get execution results from interpreter's VM
+                    let vm = interpreter.get_vm();
+                    let stack = vm.get_stack();
+                    let memory = vm.get_memory_map();
+                    let execution_time = start_time.elapsed().as_millis() as u64;
+                    
+                    // Return successful result with VM
+                    Ok(ExecutionResult {
+                        success: true,
+                        error: None,
+                        execution_time_ms: execution_time,
+                        stack: Some(stack),
+                        memory: Some(memory),
+                        operations_executed: ops.len(),
+                        vm: Some(vm.clone()),
+                    })
+                }
+                Err(e) => {
+                    // Return error result
+                    Ok(ExecutionResult {
+                        success: false,
+                        error: Some(e.to_string()),
+                        execution_time_ms: start_time.elapsed().as_millis() as u64,
+                        stack: None,
+                        memory: None,
+                        operations_executed: 0,
+                        vm: None,
+                    })
+                }
+            }
+        } else {
+            // Execute directly with AST interpreter
+            let mut vm = vm::VM::create_with_options(&options)?;
+            
+            if let Some(params) = &options.parameters {
+                vm.set_parameters(params.clone())?;
+            }
+            
+            // Execute the program
+            match vm.execute(&ops) {
+                Ok(()) => {
+                    // Get execution results
+                    let stack = vm.get_stack();
+                    let memory = vm.get_memory_map();
+                    let execution_time = start_time.elapsed().as_millis() as u64;
+                    
+                    // Return successful result with VM
+                    Ok(ExecutionResult {
+                        success: true,
+                        error: None,
+                        execution_time_ms: execution_time,
+                        stack: Some(stack),
+                        memory: Some(memory),
+                        operations_executed: ops.len(),
+                        vm: Some(vm),
+                    })
+                }
+                Err(e) => {
+                    // Return error result
+                    Ok(ExecutionResult {
+                        success: false,
+                        error: Some(e.to_string()),
+                        execution_time_ms: start_time.elapsed().as_millis() as u64,
+                        stack: None,
+                        memory: None,
+                        operations_executed: 0,
+                        vm: None,
+                    })
+                }
+            }
+        }
+    };
+    
+    result
 }
 
 #[cfg(test)]

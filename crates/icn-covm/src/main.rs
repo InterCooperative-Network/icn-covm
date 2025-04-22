@@ -907,7 +907,21 @@ async fn run_with_federation(
         };
         
         // Use the new library function to execute the program
-        let result = execute_program_from_path(program_path, options)?;
+        let mut result = execute_program_from_path(program_path, options)?;
+        
+        // Attach the network node to the VM for federation operations
+        if let Some(vm) = &mut result.vm {
+            #[cfg(feature = "federation")]
+            vm.set_network_node(network_node);
+        } else {
+            // If VM is not available for some reason, just keep the node running
+            info!("VM not available to attach network node. Running in network-only mode.");
+            
+            // Keep the node running until interrupted
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        }
         
         // Handle the result and print information according to the verbose flag
         if verbose {

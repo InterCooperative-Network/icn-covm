@@ -55,11 +55,16 @@ pub mod memory;
 pub mod ops;
 pub mod stack;
 pub mod types;
-mod vm;
+#[cfg(feature = "federation")]
+pub mod federation_ext;
 pub mod typed_trace;
+pub mod vm;
 
 // Re-export main VM types and components
-pub use errors::VMError;
+pub use errors::{
+    ArgumentError, ArithmeticError, CallError, CastError, ExecutionError, FunctionError,
+    IntrinsicError, MemoryError, ParseError, StorageError, VMError, VerificationError, Error,
+};
 pub use execution::{ExecutorOps, VMExecution};
 pub use memory::{MemoryScope, VMMemory};
 pub use stack::{StackOps, VMStack};
@@ -85,3 +90,6 @@ pub enum MissingKeyBehavior {
     /// Return an error when a key is not found
     Error,
 }
+
+#[cfg(feature = "federation")]
+pub use federation_ext::VMFederationExtension;

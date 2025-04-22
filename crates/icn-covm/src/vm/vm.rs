@@ -16,6 +16,11 @@
 //! - Provides a solid foundation for extending VM capabilities
 //! - Facilitates both AST interpretation and bytecode execution
 
+use std::fmt::Debug;
+use std::marker::{Send, Sync};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use crate::storage::auth::AuthContext;
 use crate::storage::traits::Storage;
 use crate::typed::TypedValue;
@@ -28,9 +33,11 @@ use crate::vm::typed_trace::VMTracer;
 use icn_ledger::DagLedger;
 
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::marker::{Send, Sync};
-use std::path::PathBuf;
+
+#[cfg(feature = "federation")]
+use crate::federation::NetworkNode;
+#[cfg(feature = "federation")]
+use crate::vm::federation_ext::VMFederationExtension;
 
 /// Defines behavior when a key is not found in storage operations
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,6 +86,10 @@ where
     
     /// Execution tracer for recording operation history
     pub tracer: Option<VMTracer>,
+
+    /// Federation network node (if federation is enabled)
+    #[cfg(feature = "federation")]
+    pub network_node: Option<Arc<Mutex<NetworkNode>>>,
 }
 
 impl<S> VM<S>
@@ -98,6 +109,8 @@ where
             simulation_mode: false,
             verbose_storage_trace: false,
             tracer: None,
+            #[cfg(feature = "federation")]
+            network_node: None,
         }
     }
 
@@ -206,6 +219,8 @@ where
             simulation_mode: self.simulation_mode,
             verbose_storage_trace: self.verbose_storage_trace,
             tracer: self.tracer.clone(),
+            #[cfg(feature = "federation")]
+            network_node: self.network_node.clone(),
         })
     }
 
@@ -281,6 +296,8 @@ where
             simulation_mode: self.simulation_mode,
             verbose_storage_trace: self.verbose_storage_trace,
             tracer: self.tracer.clone(),
+            #[cfg(feature = "federation")]
+            network_node: self.network_node.clone(),
         })
     }
 
@@ -858,28 +875,33 @@ where
     /// Generate an explanation for an operation
     fn explain_op(&self, op: &Op) -> String {
         match op {
-            Op::Push(val) => format!("Push the value {:?} onto the stack", val),
+            Op::Push(value) => format!("Push value {:?} onto the stack", value),
             Op::Add => "Add the top two values on the stack".into(),
             Op::Sub => "Subtract the top value from the second value on the stack".into(),
             Op::Mul => "Multiply the top two values on the stack".into(),
             Op::Div => "Divide the second value by the top value on the stack".into(),
-            Op::Mod => {
-                "Compute the remainder when dividing the second value by the top value".into()
+            Op::Mod => "Calculate the remainder of the second value divided by the top value".into(),
+            Op::Store(key) => format!("Store the top value in memory with key '{}'", key),
+            Op::Load(key) => format!("Load value with key '{}' from memory", key),
+            Op::If {
+                condition,
+                then,
+                else_,
+            } => {
+                let mut s = "If the condition is true, execute 'then' branch".to_string();
+                if else_.is_some() {
+                    s.push_str(", otherwise execute 'else' branch");
+                }
+                s
             }
-            Op::Store(name) => format!("Store the top stack value in memory under '{}'", name),
-            Op::Load(name) => format!(
-                "Load the value of '{}' from memory and push it onto the stack",
-                name
-            ),
-            Op::If { .. } => "Execute code conditionally based on a value".into(),
-            Op::Loop { count, .. } => format!("Execute a block of code {} times", count),
-            Op::While { .. } => "Execute a block of code while a condition is true".into(),
-            Op::Emit(msg) => format!("Output the message: {}", msg),
-            Op::Negate => "Negate the top value on the stack".into(),
-            Op::AssertTop(val) => format!("Assert that the top value equals {:?}", val),
-            Op::DumpStack => "Display the current stack contents".into(),
-            Op::DumpMemory => "Display the current memory contents".into(),
-            Op::AssertMemory { key, expected } => {
+            Op::Loop { count, body } => {
+                format!("Execute the body {} times", count)
+            }
+            Op::While { condition, body } => {
+                "While the condition is true, execute the body".to_string()
+            }
+            Op::Assert { message } => format!("Assert that the top value is true ({})", message),
+            Op::AssertEq { key, expected } => {
                 format!("Assert that memory value '{}' equals {:?}", key, expected)
             }
             Op::Pop => "Remove the top value from the stack".into(),
@@ -918,6 +940,73 @@ where
             ),
             _ => format!("Execute operation: {}", op),
         }
+    }
+}
+
+#[cfg(feature = "federation")]
+impl<S> VMFederationExtension<S> for VM<S> 
+where
+    S: Storage + Send + Sync + Clone + Debug + 'static
+{
+    fn get_network_node(&self) -> Option<&Arc<Mutex<NetworkNode>>> {
+        self.network_node.as_ref()
+    }
+    
+    fn set_network_node(&mut self, node: NetworkNode) {
+        self.network_node = Some(Arc::new(Mutex::new(node)));
+    }
+    
+    fn count_federated_proposals(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        use crate::federation::storage::{FederationStorage, FEDERATION_NAMESPACE};
+        
+        let storage = self.get_storage_backend()
+            .ok_or_else(|| "Storage backend not available".to_string())?;
+        
+        let federation_storage = FederationStorage::new();
+        let count = federation_storage.count_proposals(&*storage)
+            .map_err(|e| format!("Failed to count proposals: {}", e))?;
+        
+        Ok(count)
+    }
+    
+    fn count_federated_votes(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        use crate::federation::storage::VOTES_NAMESPACE;
+        
+        let storage = self.get_storage_backend()
+            .ok_or_else(|| "Storage backend not available".to_string())?;
+            
+        let keys = storage.list_keys(None, VOTES_NAMESPACE, None)
+            .map_err(|e| format!("Failed to list vote keys: {}", e))?;
+            
+        Ok(keys.len())
+    }
+    
+    fn federation_log_message(&self, message: serde_json::Value, auth_context: &AuthContext) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::federation::storage::FEDERATION_NAMESPACE;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use uuid::Uuid;
+        
+        let storage = self.get_storage_backend()
+            .ok_or_else(|| "Storage backend not available".to_string())?;
+            
+        // Create a key for the log message
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+            
+        let msg_id = Uuid::new_v4().to_string();
+        let log_key = format!("federation/logs/{}-{}", timestamp, msg_id);
+        
+        // Serialize the message
+        let message_data = serde_json::to_vec(&message)
+            .map_err(|e| format!("Failed to serialize log message: {}", e))?;
+            
+        // Store the message in the federation namespace
+        storage.set(Some(auth_context), FEDERATION_NAMESPACE, &log_key, message_data)
+            .map_err(|e| format!("Failed to store log message: {}", e))?;
+            
+        Ok(())
     }
 }
 
