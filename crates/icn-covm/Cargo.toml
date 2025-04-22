@@ -40,4 +40,5 @@ tempfile = "3.8"
 
 [features]
 default = []
-typed-values = [] 
+typed-values = []
+federation = [] 

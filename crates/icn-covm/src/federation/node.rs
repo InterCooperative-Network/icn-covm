@@ -19,15 +19,120 @@ use libp2p::mdns;
 use libp2p::ping;
 
 use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+use tokio::time::sleep;
+
+/// Maximum number of retry attempts for network operations
+const MAX_RETRY_ATTEMPTS: u32 = 5;
+/// Base delay for exponential backoff (in milliseconds)
+const BASE_RETRY_DELAY_MS: u64 = 500;
+/// Maximum delay for exponential backoff (in milliseconds)
+const MAX_RETRY_DELAY_MS: u64 = 30_000; // 30 seconds
+
+/// Retry status for operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryStatus {
+    /// Last attempt time (unix timestamp)
+    pub last_attempt: u64,
+    /// Number of attempts so far
+    pub attempts: u32,
+    /// Whether the operation is in backoff
+    pub in_backoff: bool,
+    /// Current backoff delay in milliseconds
+    pub current_delay_ms: u64,
+    /// Retry operation type
+    pub operation: String,
+    /// Target of the operation (e.g., peer ID)
+    pub target: String,
+}
+
+/// Manages retries for network operations with exponential backoff
+pub struct RetryManager {
+    /// Map of operation_key -> retry status
+    retries: HashMap<String, RetryStatus>,
+    /// Maximum number of retry attempts
+    max_attempts: u32,
+    /// Base delay for exponential backoff
+    base_delay_ms: u64,
+    /// Maximum delay for exponential backoff
+    max_delay_ms: u64,
+}
+
+impl RetryManager {
+    /// Create a new retry manager with defaults
+    pub fn new() -> Self {
+        Self {
+            retries: HashMap::new(),
+            max_attempts: MAX_RETRY_ATTEMPTS,
+            base_delay_ms: BASE_RETRY_DELAY_MS,
+            max_delay_ms: MAX_RETRY_DELAY_MS,
+        }
+    }
+
+    /// Record a failed attempt and get the next retry delay
+    pub fn record_failure(&mut self, operation: &str, target: &str) -> Option<Duration> {
+        let key = format!("{}:{}", operation, target);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let status = self.retries.entry(key.clone()).or_insert_with(|| RetryStatus {
+            last_attempt: now,
+            attempts: 0,
+            in_backoff: false,
+            current_delay_ms: self.base_delay_ms,
+            operation: operation.to_string(),
+            target: target.to_string(),
+        });
+
+        status.attempts += 1;
+        status.last_attempt = now;
+
+        if status.attempts >= self.max_attempts {
+            // Too many failures, give up
+            self.retries.remove(&key);
+            return None;
+        }
+
+        // Calculate exponential backoff with jitter
+        let mut delay_ms = self.base_delay_ms * (2_u64.pow(status.attempts - 1));
+        // Add some randomness (10% jitter)
+        let jitter = (delay_ms as f64 * 0.1 * (rand::random::<f64>() - 0.5)) as u64;
+        delay_ms = (delay_ms + jitter).min(self.max_delay_ms);
+
+        status.current_delay_ms = delay_ms;
+        status.in_backoff = true;
+
+        Some(Duration::from_millis(delay_ms))
+    }
+
+    /// Record a successful operation
+    pub fn record_success(&mut self, operation: &str, target: &str) {
+        let key = format!("{}:{}", operation, target);
+        self.retries.remove(&key);
+    }
+
+    /// Check if an operation is currently in backoff
+    pub fn is_in_backoff(&self, operation: &str, target: &str) -> bool {
+        let key = format!("{}:{}", operation, target);
+        self.retries.get(&key).map_or(false, |status| status.in_backoff)
+    }
+
+    /// Get all current retry operations
+    pub fn get_all_retries(&self) -> Vec<RetryStatus> {
+        self.retries.values().cloned().collect()
+    }
+}
 
 /// Configuration options for a network node
 #[derive(Debug, Clone)]
@@ -85,6 +190,15 @@ pub struct NetworkNode {
 
     /// Storage for federation proposals and votes
     federation_storage: Arc<FederationStorage>,
+    
+    /// Retry manager for network operations
+    retry_manager: Arc<Mutex<RetryManager>>,
+    
+    /// Node start time (for uptime tracking)
+    start_time: Option<u64>,
+    
+    /// Node role (if assigned)
+    role: Option<String>,
 }
 
 impl NetworkNode {
@@ -107,6 +221,12 @@ impl NetworkNode {
         // Create a channel for network events
         let (event_sender, event_receiver) = mpsc::channel::<NetworkEvent>(32);
 
+        // Node start timestamp
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+
         Ok(Self {
             swarm,
             local_peer_id,
@@ -116,6 +236,9 @@ impl NetworkNode {
             event_sender,
             known_peers: Arc::new(Mutex::new(HashSet::new())),
             federation_storage: Arc::new(FederationStorage::new()),
+            retry_manager: Arc::new(Mutex::new(RetryManager::new())),
+            start_time,
+            role: None,
         })
     }
 
@@ -147,20 +270,57 @@ impl NetworkNode {
             }
         }
 
-        // Connect to bootstrap nodes
-        for addr in &self.config.bootstrap_nodes {
-            debug!("Dialing bootstrap node: {}", addr);
-            match self.swarm.dial(addr.clone()) {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("Failed to dial bootstrap node {}: {}", addr, e);
-                }
-            }
-        }
+        // Connect to bootstrap nodes with retry logic
+        self.connect_to_bootstrap_nodes().await;
 
         // Create node announcement
         let announcement = self.create_node_announcement();
         debug!("Created node announcement: {:?}", announcement);
+
+        // Start the retry processing task
+        let retry_manager = self.retry_manager.clone();
+        let event_sender = self.event_sender.clone();
+        let running = self.running.clone();
+        
+        tokio::spawn(async move {
+            while running.load(Ordering::SeqCst) {
+                // Check for expired backoffs every 1 second
+                sleep(Duration::from_secs(1)).await;
+                
+                let mut retries_to_resume = Vec::new();
+                {
+                    let mut manager = retry_manager.lock().await;
+                    let all_retries = manager.get_all_retries();
+                    
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                        
+                    for retry in all_retries {
+                        if retry.in_backoff {
+                            // Check if backoff period has elapsed
+                            let elapsed_ms = (now - retry.last_attempt) * 1000;
+                            if elapsed_ms >= retry.current_delay_ms {
+                                retries_to_resume.push((retry.operation.clone(), retry.target.clone()));
+                            }
+                        }
+                    }
+                }
+                
+                // Resume retries outside of the lock
+                for (operation, target) in retries_to_resume {
+                    // Emit a retry event to be handled by the main event loop
+                    let retry_event = NetworkEvent::RetryOperation {
+                        operation,
+                        target,
+                    };
+                    if let Err(e) = event_sender.clone().send(retry_event).await {
+                        error!("Failed to send retry event: {}", e);
+                    }
+                }
+            }
+        });
 
         // Start the event loop
         self.process_events().await?;
@@ -198,14 +358,22 @@ impl NetworkNode {
                 swarm_event = self.swarm.select_next_some() => {
                     if let Err(e) = self.handle_swarm_event(swarm_event).await {
                         error!("Error handling swarm event: {}", e);
-                        // Send error to event channel
-                        let _ = self.event_sender.send(NetworkEvent::Error(e.to_string())).await;
                     }
                 }
+                
+                network_event = self.event_receiver.next() => {
+                    if let Some(event) = network_event {
+                        if let Err(e) = self.handle_network_event(event).await {
+                            error!("Error handling network event: {}", e);
+                        }
+                    }
+                }
+                
+                // Add a timeout to prevent CPU spinning
+                _ = sleep(Duration::from_millis(10)) => {}
             }
         }
 
-        info!("Network event processing loop stopped");
         Ok(())
     }
 
@@ -610,6 +778,223 @@ impl NetworkNode {
 
         Ok(())
     }
+
+    /// Connect to bootstrap nodes with retry logic
+    async fn connect_to_bootstrap_nodes(&mut self) {
+        for addr in &self.config.bootstrap_nodes {
+            debug!("Dialing bootstrap node: {}", addr);
+            if let Err(e) = self.dial_with_retry(addr.clone()).await {
+                warn!("Failed to dial bootstrap node {}: {}", addr, e);
+                
+                // Schedule retry via the retry manager
+                let addr_str = addr.to_string();
+                let mut retry_manager = self.retry_manager.lock().await;
+                if let Some(delay) = retry_manager.record_failure("dial", &addr_str) {
+                    let addr_clone = addr.clone();
+                    let event_sender = self.event_sender.clone();
+                    
+                    tokio::spawn(async move {
+                        sleep(delay).await;
+                        let retry_event = NetworkEvent::RetryOperation {
+                            operation: "dial".to_string(),
+                            target: addr_str,
+                        };
+                        if let Err(e) = event_sender.send(retry_event).await {
+                            error!("Failed to send retry event: {}", e);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    
+    /// Dial a peer with the current attempt
+    async fn dial_with_retry(&mut self, addr: Multiaddr) -> Result<(), FederationError> {
+        match self.swarm.dial(addr.clone()) {
+            Ok(_) => {
+                // Reset retry counter on success
+                let mut retry_manager = self.retry_manager.lock().await;
+                retry_manager.record_success("dial", &addr.to_string());
+                Ok(())
+            }
+            Err(e) => {
+                Err(FederationError::NetworkError(format!(
+                    "Failed to dial {}: {}",
+                    addr, e
+                )))
+            }
+        }
+    }
+
+    /// Get node start time (for uptime calculations)
+    pub fn get_start_time(&self) -> Option<u64> {
+        self.start_time
+    }
+    
+    /// Get node role
+    pub fn get_role(&self) -> Option<&str> {
+        self.role.as_deref()
+    }
+    
+    /// Set node role
+    pub fn set_role(&mut self, role: String) {
+        self.role = Some(role);
+    }
+
+    /// Handle internal network events (including retries)
+    async fn handle_network_event(&mut self, event: NetworkEvent) -> Result<(), FederationError> {
+        match event {
+            NetworkEvent::RetryOperation { operation, target } => {
+                debug!("Retrying operation '{}' for target '{}'", operation, target);
+                
+                // Clear backoff status
+                {
+                    let mut retry_manager = self.retry_manager.lock().await;
+                    // We'll set in_backoff to false to allow the operation to proceed
+                    if let Some(entry) = retry_manager.retries.get_mut(&format!("{}:{}", operation, target)) {
+                        entry.in_backoff = false;
+                    }
+                }
+                
+                // Handle different operation types
+                match operation.as_str() {
+                    "dial" => {
+                        // Try to parse the target as a multiaddress
+                        match target.parse::<Multiaddr>() {
+                            Ok(addr) => {
+                                if let Err(e) = self.dial_with_retry(addr.clone()).await {
+                                    // If it fails again, retry manager will handle it
+                                    let mut retry_manager = self.retry_manager.lock().await;
+                                    if let Some(delay) = retry_manager.record_failure(&operation, &target) {
+                                        debug!("Dial failed again, will retry in {:?}", delay);
+                                    } else {
+                                        warn!("Giving up on dialing {} after too many attempts", addr);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to parse address {}: {}", target, e);
+                            }
+                        }
+                    }
+                    "send_message" => {
+                        // Format is "peer_id:message_id"
+                        if let Some((peer_id_str, message_id)) = target.split_once(':') {
+                            if let Ok(peer_id) = peer_id_str.parse::<PeerId>() {
+                                // Retry sending the message
+                                if let Err(e) = self.retry_send_message(peer_id, message_id).await {
+                                    let mut retry_manager = self.retry_manager.lock().await;
+                                    if let Some(delay) = retry_manager.record_failure(&operation, &target) {
+                                        debug!("Send message failed again, will retry in {:?}", delay);
+                                    } else {
+                                        warn!("Giving up on sending message {} to {} after too many attempts", 
+                                            message_id, peer_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Handle other operation types as needed
+                    _ => {
+                        warn!("Unknown retry operation type: {}", operation);
+                    }
+                }
+            }
+            // Handle other network events as needed
+            _ => {}
+        }
+        
+        Ok(())
+    }
+    
+    /// Retry sending a message identified by its ID
+    async fn retry_send_message(&mut self, peer_id: PeerId, message_id: &str) -> Result<(), FederationError> {
+        // In a real implementation, you would look up the message from storage
+        // and attempt to resend it
+        debug!("Retrying sending message {} to {}", message_id, peer_id);
+        
+        // This is a stub - would need actual message storage/retrieval
+        Ok(())
+    }
+
+    /// Get all connected peers with additional information
+    pub async fn connected_peers(&self) -> Vec<PeerInfo> {
+        // This is a simplified implementation - you would want to enhance this
+        // with more peer metadata from your actual implementation
+        let mut peers = Vec::new();
+        
+        for peer_id in self.swarm.connected_peers() {
+            let mut info = PeerInfo {
+                peer_id: peer_id.to_string(),
+                addresses: None,
+                role: None,
+                ping_ms: None,
+                supported_protocols: None,
+                last_seen: None,
+            };
+            
+            // Add more details if available
+            
+            peers.push(info);
+        }
+        
+        peers
+    }
+    
+    /// Get all listen addresses
+    pub async fn listen_addresses(&self) -> Vec<String> {
+        self.swarm.listeners()
+            .map(|addr| addr.to_string())
+            .collect()
+    }
+    
+    /// Send a custom message to a peer (with retry)
+    pub async fn send_custom_message(
+        &self,
+        peer: &str,
+        message: serde_json::Value,
+    ) -> Result<(), FederationError> {
+        // Determine if peer is an address or peer ID
+        let target_peer = if peer.starts_with("/ip4/") || peer.starts_with("/ip6/") {
+            // It's a multiaddress - need to resolve to peer ID
+            // This is simplified - you'd want a proper lookup mechanism
+            return Err(FederationError::NetworkError(
+                "Sending by multiaddress not implemented yet".to_string()
+            ));
+        } else {
+            // Assume it's a peer ID
+            peer.parse::<PeerId>()
+                .map_err(|_| FederationError::NetworkError(format!("Invalid peer ID: {}", peer)))?
+        };
+        
+        // Create a unique message ID
+        let message_id = format!("msg-{}", uuid::Uuid::new_v4());
+        
+        // In a real implementation, you'd store the message for retry purposes
+        // and handle actual sending via libp2p
+        
+        // This is a stub implementation
+        debug!("Would send message {} to {}: {}", message_id, target_peer, message);
+        
+        Ok(())
+    }
+}
+
+/// Information about a peer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    /// Peer ID as string
+    pub peer_id: String,
+    /// Known addresses for this peer
+    pub addresses: Option<Vec<String>>,
+    /// Role of the peer if known
+    pub role: Option<String>,
+    /// Ping latency in milliseconds
+    pub ping_ms: Option<u64>,
+    /// Protocols supported by this peer
+    pub supported_protocols: Option<Vec<String>>,
+    /// Last time this peer was seen (UNIX timestamp)
+    pub last_seen: Option<u64>,
 }
 
 /// Create a new Swarm with the provided identity

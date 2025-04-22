@@ -53,6 +53,36 @@ pub enum VoteChoice {
     Abstain,
 }
 
+/// Vote weighting strategy for a proposal
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum VoteWeighting {
+    /// Each vote has equal weight
+    Equal,
+    /// Votes are weighted based on a reputation score
+    Reputation,
+    /// Votes are weighted based on stake/token amount
+    Stake,
+    /// Votes are weighted based on tenure in the organization
+    Tenure,
+    /// Quadratic voting - vote weight is square root of cost
+    Quadratic,
+    /// Delegated voting - vote weight includes delegated votes
+    Delegated,
+    /// Custom weighting with a specified algorithm
+    Custom(String),
+}
+
+/// Quorum calculation method
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum QuorumMethod {
+    /// Fixed percentage of total possible voters 
+    Percentage(u8), // 0-100
+    /// Fixed number of voters required
+    FixedNumber(u64),
+    /// No quorum requirement
+    None,
+}
+
 // Implement FromStr to parse from CLI string input
 use std::str::FromStr;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +107,70 @@ impl FromStr for VoteChoice {
     }
 }
 
+/// Parse error for VoteWeighting
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseVoteWeightingError;
+impl std::fmt::Display for ParseVoteWeightingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid vote weighting. Must be 'equal', 'reputation', 'stake', 'tenure', 'quadratic', 'delegated', or 'custom:<name>'.")
+    }
+}
+impl std::error::Error for ParseVoteWeightingError {}
+
+impl FromStr for VoteWeighting {
+    type Err = ParseVoteWeightingError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "equal" => Ok(VoteWeighting::Equal),
+            "reputation" => Ok(VoteWeighting::Reputation),
+            "stake" => Ok(VoteWeighting::Stake),
+            "tenure" => Ok(VoteWeighting::Tenure),
+            "quadratic" => Ok(VoteWeighting::Quadratic),
+            "delegated" => Ok(VoteWeighting::Delegated),
+            s if s.starts_with("custom:") => {
+                let custom_name = s.strip_prefix("custom:").unwrap().to_string();
+                Ok(VoteWeighting::Custom(custom_name))
+            }
+            _ => Err(ParseVoteWeightingError),
+        }
+    }
+}
+
+/// Parse error for QuorumMethod
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseQuorumMethodError;
+impl std::fmt::Display for ParseQuorumMethodError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid quorum method. Must be 'percentage:<0-100>', 'fixed:<number>', or 'none'.")
+    }
+}
+impl std::error::Error for ParseQuorumMethodError {}
+
+impl FromStr for QuorumMethod {
+    type Err = ParseQuorumMethodError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase() {
+            s if s.starts_with("percentage:") => {
+                let percentage_str = s.strip_prefix("percentage:").unwrap();
+                let percentage = percentage_str.parse::<u8>().map_err(|_| ParseQuorumMethodError)?;
+                if percentage > 100 {
+                    return Err(ParseQuorumMethodError);
+                }
+                Ok(QuorumMethod::Percentage(percentage))
+            }
+            s if s.starts_with("fixed:") => {
+                let number_str = s.strip_prefix("fixed:").unwrap();
+                let number = number_str.parse::<u64>().map_err(|_| ParseQuorumMethodError)?;
+                Ok(QuorumMethod::FixedNumber(number))
+            }
+            "none" => Ok(QuorumMethod::None),
+            _ => Err(ParseQuorumMethodError),
+        }
+    }
+}
+
 // Implement Display to serialize for storage?
 // Or maybe store as string directly is better for simplicity/flexibility?
 // Let's stick to storing the string for now, less migration hassle.
@@ -88,13 +182,18 @@ pub struct ProposalLifecycle {
     pub created_at: DateTime<Utc>,
     pub state: ProposalState,
     pub title: String, // Added title based on CLI command
-    // TODO: Define quorum and threshold properly (e.g., percentage, fixed number)
-    pub quorum: u64,
-    pub threshold: u64,
+    // Enhanced quorum and threshold
+    pub quorum_method: QuorumMethod,
+    pub approval_threshold: u8, // Percentage (0-100) needed for approval
     pub expires_at: Option<DateTime<Utc>>, // Voting expiration
     pub discussion_duration: Option<Duration>, // For macro integration
+    pub vote_weighting: VoteWeighting, // How votes are weighted
     pub required_participants: Option<u64>, // For macro integration
     pub current_version: u64,
+    // Additional settings for expanded governance
+    pub auto_execute: bool, // Whether to execute automatically when passed
+    pub allow_early_execution: bool, // Whether to allow execution before expiry
+    pub min_voting_period: Option<Duration>, // Minimum time votes must be open
     // attachments: Vec<Attachment>, // Store attachment metadata or links? Store in storage layer.
     // comments: Vec<CommentId>, // Store comment IDs? Store in storage layer.
     pub history: Vec<(DateTime<Utc>, ProposalState)>, // Track state transitions
@@ -116,8 +215,9 @@ impl ProposalLifecycle {
         id: ProposalId,
         creator: Identity,
         title: String,
-        quorum: u64,
-        threshold: u64,
+        quorum_method: QuorumMethod,
+        approval_threshold: u8,
+        vote_weighting: VoteWeighting,
         discussion_duration: Option<Duration>,
         required_participants: Option<u64>,
     ) -> Self {
@@ -128,15 +228,53 @@ impl ProposalLifecycle {
             created_at: now,
             state: ProposalState::Draft,
             title,
-            quorum,
-            threshold,
+            quorum_method,
+            approval_threshold,
             expires_at: None, // Set when voting starts
             discussion_duration,
+            vote_weighting,
             required_participants,
             current_version: 1,
+            auto_execute: false,
+            allow_early_execution: false,
+            min_voting_period: None,
             history: vec![(now, ProposalState::Draft)],
             execution_status: None,
         }
+    }
+
+    // New helper for backwards compatibility
+    pub fn new_backwards_compatible(
+        id: ProposalId,
+        creator: Identity,
+        title: String,
+        quorum: u64,
+        threshold: u64,
+        discussion_duration: Option<Duration>,
+        required_participants: Option<u64>,
+    ) -> Self {
+        // Convert old quorum to percentage (assuming quorum was a percentage)
+        let quorum_method = if quorum == 0 {
+            QuorumMethod::None
+        } else if quorum <= 100 {
+            QuorumMethod::Percentage(quorum as u8)
+        } else {
+            QuorumMethod::FixedNumber(quorum)
+        };
+
+        // Convert old threshold to percentage (capped at 100)
+        let approval_threshold = (threshold as u8).min(100);
+
+        Self::new(
+            id,
+            creator,
+            title,
+            quorum_method,
+            approval_threshold,
+            VoteWeighting::Equal, // Default to equal weighting
+            discussion_duration,
+            required_participants,
+        )
     }
 
     // Placeholder methods for state transitions - logic to be added later
@@ -144,21 +282,48 @@ impl ProposalLifecycle {
         if self.state == ProposalState::Draft {
             self.state = ProposalState::OpenForFeedback;
             self.history.push((Utc::now(), self.state.clone()));
-            // TODO: Set expiration based on discussion_duration?
+            // If discussion duration is set, calculate when it should move to voting
+            if let Some(duration) = self.discussion_duration {
+                // This could be used by an external scheduler to auto-transition
+                let _feedback_end_time = Utc::now() + duration;
+                // In a real implementation, store this for auto-transition
+            }
         }
     }
 
     pub fn start_voting(&mut self, voting_duration: Duration) {
-        // TODO: Add checks (e.g., required participants) before allowing transition
+        // Only transition if in the OpenForFeedback state
         if self.state == ProposalState::OpenForFeedback {
             self.state = ProposalState::Voting;
+            
+            // Set expiration time
             self.expires_at = Some(Utc::now() + voting_duration);
+            
+            // Ensure minimum voting period is respected if set
+            if let Some(min_period) = self.min_voting_period {
+                if voting_duration < min_period {
+                    // Override with minimum duration
+                    self.expires_at = Some(Utc::now() + min_period);
+                }
+            }
+            
             self.history.push((Utc::now(), self.state.clone()));
         }
     }
 
     pub fn execute(&mut self) {
         if self.state == ProposalState::Voting {
+            // Check if early execution is allowed
+            if !self.allow_early_execution {
+                // Check if we're still within the voting period
+                if let Some(expires_at) = self.expires_at {
+                    if Utc::now() < expires_at {
+                        // Cannot execute early
+                        return;
+                    }
+                }
+            }
+            
             // Add logic for successful vote
             self.state = ProposalState::Executed;
             self.history.push((Utc::now(), self.state.clone()));
@@ -182,11 +347,115 @@ impl ProposalLifecycle {
         }
     }
 
+    // Check if proposal has expired and needs state update
+    pub fn check_expiry(&mut self) -> bool {
+        if self.state == ProposalState::Voting {
+            if let Some(expires_at) = self.expires_at {
+                if Utc::now() > expires_at {
+                    self.state = ProposalState::Expired;
+                    self.history.push((Utc::now(), self.state.clone()));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn update_version(&mut self) {
         // Logic for handling updates, potentially resetting state or requiring new votes?
         self.current_version += 1;
         // Maybe move back to Draft or OpenForFeedback? Depends on governance rules.
         self.history.push((Utc::now(), self.state.clone()));
+    }
+
+    // Calculate vote weight based on the proposal's weighting strategy
+    pub fn calculate_vote_weight<S>(
+        &self,
+        vm: &mut VM<S>,
+        voter: &Identity,
+        vote_choice: &VoteChoice,
+        auth_context: Option<&AuthContext>,
+    ) -> Result<f64, Box<dyn std::error::Error>>
+    where
+        S: Storage + Send + Sync + Clone + Debug + 'static,
+    {
+        // Basic vote value (1.0 for yes/no, 0.0 for abstain)
+        let base_value = match vote_choice {
+            VoteChoice::Yes | VoteChoice::No => 1.0,
+            VoteChoice::Abstain => 0.0,
+        };
+        
+        // Apply weighting based on strategy
+        match &self.vote_weighting {
+            VoteWeighting::Equal => {
+                // Every vote has the same weight
+                Ok(base_value)
+            },
+            VoteWeighting::Reputation => {
+                // Get reputation score from storage
+                let reputation_key = format!("identity:{}/reputation", voter.id_string());
+                let reputation = vm.get_f64(reputation_key.as_str(), auth_context)?
+                    .unwrap_or(1.0); // Default 1.0 if not found
+                
+                Ok(base_value * reputation)
+            },
+            VoteWeighting::Stake => {
+                // Get stake amount from storage
+                let stake_key = format!("identity:{}/stake", voter.id_string());
+                let stake = vm.get_f64(stake_key.as_str(), auth_context)?
+                    .unwrap_or(1.0); // Default 1.0 if not found
+                
+                Ok(base_value * stake)
+            },
+            VoteWeighting::Tenure => {
+                // Get join date from storage and calculate tenure in years
+                let join_date_key = format!("identity:{}/join_date", voter.id_string());
+                if let Some(join_timestamp) = vm.get_f64(join_date_key.as_str(), auth_context)? {
+                    let now = Utc::now().timestamp() as f64;
+                    let seconds_in_year = 31_536_000.0;
+                    let years = (now - join_timestamp) / seconds_in_year;
+                    // Cap at 10 years max weight
+                    let weight = 1.0 + (years.min(10.0) * 0.1); // 10% per year
+                    Ok(base_value * weight)
+                } else {
+                    // Default to 1.0 if join date not found
+                    Ok(base_value)
+                }
+            },
+            VoteWeighting::Quadratic => {
+                // Get vote cost/credits from storage
+                let credits_key = format!("proposal:{}/vote_credits/{}", self.id, voter.id_string());
+                let credits = vm.get_f64(credits_key.as_str(), auth_context)?
+                    .unwrap_or(1.0); // Default 1.0 if not found
+                
+                // Square root of credits for quadratic voting
+                let weight = credits.sqrt();
+                Ok(base_value * weight)
+            },
+            VoteWeighting::Delegated => {
+                // Get direct weight plus delegated votes
+                let direct_weight = 1.0; // Base weight
+                
+                // Get delegations from storage
+                let delegations_key = format!("identity:{}/delegated_votes", voter.id_string());
+                let delegated_count = vm.get_f64(delegations_key.as_str(), auth_context)?
+                    .unwrap_or(0.0);
+                
+                Ok(base_value * (direct_weight + delegated_count))
+            },
+            VoteWeighting::Custom(algo) => {
+                // Call a custom weight function stored in the VM
+                let function_key = format!("weight_algo:{}", algo);
+                if let Some(weight_code) = vm.get_string(function_key.as_str(), auth_context)? {
+                    // In a real implementation, would execute this code through DSL
+                    // For now, default to 1.0
+                    Ok(base_value)
+                } else {
+                    // Algorithm not found, use default
+                    Ok(base_value)
+                }
+            }
+        }
     }
 
     // Tally votes from storage
@@ -209,9 +478,7 @@ impl ProposalLifecycle {
         let prefix = format!("proposals/{}/votes/", self.id);
         let vote_keys = storage.list_keys(auth_context, namespace, Some(&prefix))?;
 
-        let mut yes_votes = 0;
-        let mut no_votes = 0;
-        let mut abstain_votes = 0;
+        let mut weighted_votes = HashMap::new();
 
         for key in vote_keys {
             if !key.starts_with(&prefix) || key.split('/').count() != 4 {
@@ -223,9 +490,10 @@ impl ProposalLifecycle {
                     let vote_str = String::from_utf8(vote_bytes).unwrap_or_default();
                     // Parse the stored string into VoteChoice
                     match VoteChoice::from_str(&vote_str) {
-                        Ok(VoteChoice::Yes) => yes_votes += 1,
-                        Ok(VoteChoice::No) => no_votes += 1,
-                        Ok(VoteChoice::Abstain) => abstain_votes += 1,
+                        Ok(vote_choice) => {
+                            let weight = self.calculate_vote_weight(vm, &self.creator, &vote_choice, auth_context)?;
+                            weighted_votes.insert(vote_choice.to_string(), weight.round() as Vote);
+                        }
                         Err(_) => eprintln!(
                             "Warning: Invalid vote choice string '{}' found in storage for key {}",
                             vote_str, key
@@ -238,47 +506,59 @@ impl ProposalLifecycle {
             }
         }
 
-        let mut votes = HashMap::new();
-        votes.insert("yes".to_string(), yes_votes);
-        votes.insert("no".to_string(), no_votes);
-        votes.insert("abstain".to_string(), abstain_votes);
-
-        Ok(votes)
+        Ok(weighted_votes)
     }
-
-    // Check if the proposal passed based on tallied votes
-    pub fn check_passed<S>(
+    
+    // Check if quorum is reached based on quorum_method
+    pub fn is_quorum_reached<S>(
         &self,
         vm: &mut VM<S>,
         auth_context: Option<&AuthContext>,
-        votes: &HashMap<String, Vote>,
+        vote_count: usize,
+        total_eligible: usize,
     ) -> Result<bool, Box<dyn std::error::Error>>
     where
         S: Storage + Send + Sync + Clone + Debug + 'static,
     {
-        // 1. Quorum Check: Total participating votes (yes + no) >= quorum
-        let total_votes = votes.get("yes").unwrap_or(&0) + votes.get("no").unwrap_or(&0);
-        if total_votes < self.quorum {
-            println!("Quorum not met: {} votes < {}", total_votes, self.quorum);
-            return Ok(false);
+        match self.quorum_method {
+            QuorumMethod::None => {
+                // No quorum requirement
+                Ok(true)
+            },
+            QuorumMethod::Percentage(percentage) => {
+                if total_eligible == 0 {
+                    return Ok(false); // No eligible voters
+                }
+                
+                // Calculate participation percentage
+                let participation_percent = (vote_count as f64 / total_eligible as f64) * 100.0;
+                Ok(participation_percent >= percentage as f64)
+            },
+            QuorumMethod::FixedNumber(required_count) => {
+                // Check if we have enough votes
+                Ok(vote_count as u64 >= required_count)
+            }
         }
-
-        // 2. Threshold Check: yes_votes >= threshold (assuming threshold is a fixed number for now)
-        // TODO: Handle percentage thresholds (yes_votes as f64 / total_votes as f64 >= threshold_percentage)
-        let yes_votes = votes.get("yes").unwrap_or(&0);
-        if yes_votes < &self.threshold {
-            println!(
-                "Threshold not met: {} yes votes < {}",
-                yes_votes, self.threshold
-            );
-            return Ok(false);
+    }
+    
+    // Check if approval threshold is met
+    pub fn is_threshold_met<S>(
+        &self,
+        vm: &mut VM<S>,
+        auth_context: Option<&AuthContext>,
+        yes_weight: f64,
+        total_weight: f64,
+    ) -> Result<bool, Box<dyn std::error::Error>>
+    where
+        S: Storage + Send + Sync + Clone + Debug + 'static,
+    {
+        if total_weight <= 0.0 {
+            return Ok(false); // No votes
         }
-
-        println!(
-            "Proposal passed: Quorum ({}/{}) and Threshold ({}/{}) met.",
-            total_votes, self.quorum, yes_votes, self.threshold
-        );
-        Ok(true)
+        
+        // Calculate approval percentage
+        let approval_percent = (yes_weight / total_weight) * 100.0;
+        Ok(approval_percent >= self.approval_threshold as f64)
     }
 
     // Execute the proposal's logic attachment within the given VM context

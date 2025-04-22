@@ -2,6 +2,7 @@
 
 use icn_covm::api;
 use icn_covm::bytecode::{BytecodeCompiler, BytecodeInterpreter};
+use icn_covm::cli::dag_sync::{execute as execute_dag_command, DagCommand};
 use icn_covm::cli::federation::{federation_command, handle_federation_command};
 use icn_covm::cli::proposal::{handle_proposal_command, proposal_command};
 use icn_covm::cli::proposal_demo::run_proposal_demo;
@@ -23,7 +24,7 @@ use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 use thiserror::Error;
@@ -259,15 +260,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         ),
                 )
         )
-        .subcommand(proposal_command())
-        .subcommand(federation_command())
         .subcommand(
-            Command::new("proposal-demo")
-                .about("Run a demo of the proposal lifecycle")
-        )
-        .subcommand(
-            Command::new("storage")
-                .about("Storage inspection commands")
+            Command::new("keys")
+                .about("Key-value storage commands")
                 .arg(
                     Arg::new("storage-backend")
                         .long("storage-backend")
@@ -317,8 +312,205 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 )
         )
         .subcommand(
-            Command::new("dag-trace")
-                .about("View the DAG ledger trace of proposal events")
+            Command::new("storage")
+                .about("Storage commands")
+                .arg(
+                    Arg::new("storage-backend")
+                        .long("storage-backend")
+                        .value_name("TYPE")
+                        .help("Storage backend type (memory or file)")
+                        .default_value("file"),
+                )
+                .arg(
+                    Arg::new("storage-path")
+                        .long("storage-path")
+                        .value_name("PATH")
+                        .help("Path for file storage backend")
+                        .default_value("./storage"),
+                )
+                .subcommand(
+                    Command::new("list-keys")
+                        .about("List all keys in a namespace")
+                        .arg(
+                            Arg::new("namespace")
+                                .help("Namespace to list keys from")
+                                .required(true)
+                                .index(1),
+                        )
+                        .arg(
+                            Arg::new("prefix")
+                                .short('p')
+                                .long("prefix")
+                                .help("Only list keys with this prefix")
+                                .value_name("PREFIX"),
+                        )
+                )
+                .subcommand(
+                    Command::new("get-value")
+                        .about("Get a value from storage")
+                        .arg(
+                            Arg::new("namespace")
+                                .help("Namespace to get value from")
+                                .required(true)
+                                .index(1),
+                        )
+                        .arg(
+                            Arg::new("key")
+                                .help("Key to get value for")
+                                .required(true)
+                                .index(2),
+                        )
+                )
+        )
+        .subcommand(
+            Command::new("dag")
+                .about("DAG state synchronization commands")
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("sync")
+                        .about("Synchronize state with a specific peer")
+                        .arg(
+                            Arg::new("peer")
+                                .short('p')
+                                .long("peer")
+                                .value_name("PEER_ADDR")
+                                .help("Peer to sync with (multiaddr)")
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("namespace")
+                                .short('n')
+                                .long("namespace")
+                                .value_name("NAMESPACE")
+                                .help("Specific namespace to sync (defaults to all)"),
+                        )
+                        .arg(
+                            Arg::new("limit")
+                                .short('l')
+                                .long("limit")
+                                .value_name("LIMIT")
+                                .help("Maximum number of vertices to sync")
+                                .default_value("1000"),
+                        )
+                        .arg(
+                            Arg::new("verbose")
+                                .short('v')
+                                .long("verbose")
+                                .help("Show detailed output during sync")
+                                .action(ArgAction::SetTrue),
+                        )
+                )
+                .subcommand(
+                    Command::new("status")
+                        .about("Show the status of the local DAG")
+                        .arg(
+                            Arg::new("verbose")
+                                .short('v')
+                                .long("verbose")
+                                .help("Show detailed statistics")
+                                .action(ArgAction::SetTrue),
+                        )
+                        .arg(
+                            Arg::new("namespace")
+                                .short('n')
+                                .long("namespace")
+                                .value_name("NAMESPACE")
+                                .help("Filter results to a specific namespace"),
+                        )
+                )
+                .subcommand(
+                    Command::new("export")
+                        .about("Export the DAG state to a file")
+                        .arg(
+                            Arg::new("output")
+                                .short('o')
+                                .long("output")
+                                .value_name("FILE")
+                                .help("Output file path")
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("namespace")
+                                .short('n')
+                                .long("namespace")
+                                .value_name("NAMESPACE")
+                                .help("Filter to specific namespace"),
+                        )
+                        .arg(
+                            Arg::new("format")
+                                .short('f')
+                                .long("format")
+                                .value_name("FORMAT")
+                                .help("Export format (json, msgpack)")
+                                .default_value("json"),
+                        )
+                )
+                .subcommand(
+                    Command::new("import")
+                        .about("Import DAG state from a file")
+                        .arg(
+                            Arg::new("input")
+                                .short('i')
+                                .long("input")
+                                .value_name("FILE")
+                                .help("Input file path")
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("namespace")
+                                .short('n')
+                                .long("namespace")
+                                .value_name("NAMESPACE")
+                                .help("Optional target namespace (overrides namespace in file)"),
+                        )
+                        .arg(
+                            Arg::new("force")
+                                .short('f')
+                                .long("force")
+                                .help("Force import even if conflicts exist")
+                                .action(ArgAction::SetTrue),
+                        )
+                )
+                .subcommand(
+                    Command::new("gossip")
+                        .about("Start gossip sync protocol")
+                        .arg(
+                            Arg::new("enable")
+                                .short('e')
+                                .long("enable")
+                                .help("Enable or disable gossip sync")
+                                .action(ArgAction::SetTrue),
+                        )
+                        .arg(
+                            Arg::new("interval")
+                                .short('i')
+                                .long("interval")
+                                .value_name("SECONDS")
+                                .help("Sync interval in seconds")
+                                .default_value("300"),
+                        )
+                        .arg(
+                            Arg::new("max-peers")
+                                .short('m')
+                                .long("max-peers")
+                                .value_name("COUNT")
+                                .help("Maximum peers to sync with simultaneously")
+                                .default_value("3"),
+                        )
+                        .arg(
+                            Arg::new("namespaces")
+                                .short('n')
+                                .long("namespaces")
+                                .value_name("NAMESPACES")
+                                .help("Namespaces to sync (comma-separated)"),
+                        )
+                )
+        )
+        .subcommand(proposal_command())
+        .subcommand(federation_command())
+        .subcommand(
+            Command::new("demo")
+                .about("Run a governance proposal demo with sample data")
         )
         .subcommand(api_cmd)
         .get_matches();
@@ -465,14 +657,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             _ => Err("Unknown identity subcommand".into()),
         },
-        Some(("proposal", sub_matches)) => {
-            let auth_context =
-                get_or_create_auth_context(default_storage_backend, default_storage_path)?;
-            let storage = setup_storage(default_storage_backend, default_storage_path)?;
-            let mut vm = VM::with_storage_backend(storage);
-            handle_proposal_command(&mut vm, sub_matches, &auth_context).map_err(|e| e.into())
+        Some(("keys", keys_matches)) => {
+            let storage_backend = keys_matches
+                .get_one::<String>("storage-backend")
+                .ok_or_else(|| "Missing required argument: storage-backend")?;
+            let storage_path = keys_matches
+                .get_one::<String>("storage-path")
+                .ok_or_else(|| "Missing required argument: storage-path")?;
+
+            match keys_matches.subcommand() {
+                Some(("list-keys", list_keys_matches)) => {
+                    let namespace = list_keys_matches
+                        .get_one::<String>("namespace")
+                        .ok_or_else(|| "Missing required argument: namespace")?;
+                    let prefix = list_keys_matches.get_one::<String>("prefix");
+                    list_keys_command(namespace, prefix, storage_backend, storage_path)
+                }
+                Some(("get-value", get_value_matches)) => {
+                    let namespace = get_value_matches
+                        .get_one::<String>("namespace")
+                        .ok_or_else(|| "Missing required argument: namespace")?;
+                    let key = get_value_matches
+                        .get_one::<String>("key")
+                        .ok_or_else(|| "Missing required argument: key")?;
+                    get_value_command(namespace, key, storage_backend, storage_path)
+                }
+                _ => Err("Unknown keys subcommand".into()),
+            }
         }
-        Some(("proposal-demo", _)) => run_proposal_demo().map_err(|e| e.to_string().into()),
         Some(("storage", storage_matches)) => {
             let storage_backend = storage_matches
                 .get_one::<String>("storage-backend")
@@ -501,31 +713,95 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 _ => Err("Unknown storage subcommand".into()),
             }
         }
-        Some(("federation", sub_matches)) => {
+        Some(("dag", dag_matches)) => {
             let auth_context =
                 get_or_create_auth_context(default_storage_backend, default_storage_path)?;
             let storage = setup_storage(default_storage_backend, default_storage_path)?;
             let mut vm = VM::with_storage_backend(storage);
-            handle_federation_command(&mut vm, sub_matches, &auth_context)
-                .await
-                .map_err(|e| e.into())
-        }
-        Some(("dag-trace", _)) => {
-            let storage = setup_storage(default_storage_backend, default_storage_path)?;
-            let auth_context =
-                get_or_create_auth_context(default_storage_backend, default_storage_path)?;
-            let mut vm = VM::with_storage_backend(storage);
-            vm.set_auth_context(auth_context);
-            if let Some(dag) = &vm.dag {
-                println!("📜 DAG Trace:");
-                for node in dag.trace_all() {
-                    println!("{:#?}", node);
+            
+            // Create a DagCommand struct from the matches
+            let cmd = match dag_matches.subcommand() {
+                Some(("sync", sync_matches)) => {
+                    DagCommand {
+                        command: icn_covm::cli::dag_sync::DagSubcommand::Sync {
+                            peer: sync_matches.get_one::<String>("peer")
+                                .ok_or_else(|| "Missing required argument: peer")?.to_string(),
+                            namespace: sync_matches.get_one::<String>("namespace").cloned(),
+                            limit: sync_matches.get_one::<String>("limit")
+                                .map(|s| s.parse::<usize>().unwrap_or(1000))
+                                .unwrap_or(1000),
+                            verbose: sync_matches.get_flag("verbose"),
+                        }
+                    }
                 }
-            } else {
-                println!("DAG not initialized");
+                Some(("status", status_matches)) => {
+                    DagCommand {
+                        command: icn_covm::cli::dag_sync::DagSubcommand::Status {
+                            verbose: status_matches.get_flag("verbose"),
+                            namespace: status_matches.get_one::<String>("namespace").cloned(),
+                        }
+                    }
+                }
+                Some(("export", export_matches)) => {
+                    DagCommand {
+                        command: icn_covm::cli::dag_sync::DagSubcommand::Export {
+                            output: PathBuf::from(export_matches.get_one::<String>("output")
+                                .ok_or_else(|| "Missing required argument: output")?),
+                            namespace: export_matches.get_one::<String>("namespace").cloned(),
+                            format: export_matches.get_one::<String>("format")
+                                .map(|s| s.clone())
+                                .unwrap_or_else(|| "json".to_string()),
+                        }
+                    }
+                }
+                Some(("import", import_matches)) => {
+                    DagCommand {
+                        command: icn_covm::cli::dag_sync::DagSubcommand::Import {
+                            input: PathBuf::from(import_matches.get_one::<String>("input")
+                                .ok_or_else(|| "Missing required argument: input")?),
+                            namespace: import_matches.get_one::<String>("namespace").cloned(),
+                            force: import_matches.get_flag("force"),
+                        }
+                    }
+                }
+                Some(("gossip", gossip_matches)) => {
+                    DagCommand {
+                        command: icn_covm::cli::dag_sync::DagSubcommand::Gossip {
+                            enable: gossip_matches.get_flag("enable"),
+                            interval: gossip_matches.get_one::<String>("interval")
+                                .map(|s| s.parse::<u64>().unwrap_or(300))
+                                .unwrap_or(300),
+                            max_peers: gossip_matches.get_one::<String>("max-peers")
+                                .map(|s| s.parse::<usize>().unwrap_or(3))
+                                .unwrap_or(3),
+                            namespaces: gossip_matches.get_one::<String>("namespaces").cloned(),
+                        }
+                    }
+                }
+                _ => return Err("Unknown dag subcommand".into()),
+            };
+            
+            // Execute the DAG command
+            match execute_dag_command(cmd, &mut vm, &auth_context).await {
+                Ok(output) => {
+                    match output {
+                        icn_covm::cli::helpers::Output::Info(message) => {
+                            println!("{}", message);
+                            Ok(())
+                        }
+                        icn_covm::cli::helpers::Output::Warning(message) => {
+                            println!("⚠️  Warning: {}", message);
+                            Ok(())
+                        }
+                        icn_covm::cli::helpers::Output::Error(message) => {
+                            Err(AppError::Other(message))
+                        }
+                    }
+                }
+                Err(e) => Err(AppError::Other(e.to_string())),
             }
-            Ok(())
         }
+        Some(("demo", _)) => run_proposal_demo().map_err(|e| e.to_string().into()),
         Some(("api", api_matches)) => {
             let port = api_matches.get_one::<u16>("port").copied().unwrap_or(3030);
             println!("Starting API server on port {}...", port);

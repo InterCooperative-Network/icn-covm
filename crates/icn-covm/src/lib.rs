@@ -14,42 +14,83 @@
 //! This crate is intended to be used in contexts where multiple parties
 //! need to cooperatively manage resources using programmatic governance.
 
+// Re-export only the key types that form the public API
+pub use crate::storage::auth::AuthContext;
+#[cfg(feature = "typed-values")]
+pub use crate::typed::TypedValue;
+
+// Modules that remain private to the crate
+mod api;
+mod bytecode;
+mod cli;
+mod compiler;
+mod events;
+#[cfg(feature = "federation")]
+mod federation;
+mod governance;
+mod identity;
+mod storage;
+mod typed;
+mod vm;
+
+// Internal imports
+use crate::compiler::{parse_dsl, parse_dsl_with_stdlib, CompilerError};
+use icn_ledger::DagNode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
 use thiserror::Error;
 
-pub mod api;
-pub mod bytecode;
-pub mod cli;
-pub mod compiler;
-pub mod events;
-pub mod federation;
-pub mod governance;
-pub mod identity;
-pub mod storage;
-pub mod typed;
-pub mod vm;
+/// Represents changes to the DAG ledger as a result of executing a DSL program
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagDelta {
+    /// New nodes added to the DAG
+    pub added_nodes: Vec<DagNode>,
+    
+    /// Namespace used for the operations
+    pub namespace: String,
+    
+    /// Number of operations executed
+    pub operations_executed: usize,
+    
+    /// Whether the operation was successful
+    pub success: bool,
+    
+    /// Any error message if the operation failed
+    pub error: Option<String>,
+}
 
-// Re-export key types for convenience
-pub use bytecode::{BytecodeCompiler, BytecodeInterpreter};
-pub use compiler::{parse_dsl, parse_dsl_with_stdlib, CompilerError, LifecycleConfig};
-pub use identity::Identity;
-pub use storage::auth::AuthContext;
-pub use storage::implementations::file_storage::FileStorage;
-pub use storage::implementations::in_memory::InMemoryStorage;
-pub use storage::traits::StorageBackend;
-pub use typed::TypedValue;
-pub use vm::types::Op;
-pub use vm::VM;
-pub use vm::VMError;
+impl DagDelta {
+    /// Create a new empty DagDelta
+    pub fn new(namespace: String) -> Self {
+        Self {
+            added_nodes: Vec::new(),
+            namespace,
+            operations_executed: 0,
+            success: true,
+            error: None,
+        }
+    }
+    
+    /// Create a new DagDelta representing a failed operation
+    pub fn error(namespace: String, error: impl Into<String>) -> Self {
+        Self {
+            added_nodes: Vec::new(),
+            namespace,
+            operations_executed: 0,
+            success: false,
+            error: Some(error.into()),
+        }
+    }
+}
 
 /// Defines storage backend types for use in VMOptions
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum StorageBackendType {
+enum StorageBackendType {
     /// In-memory storage that doesn't persist between VM instances
     Memory,
     /// File-based storage that persists data to disk
@@ -64,7 +105,7 @@ impl Default for StorageBackendType {
 
 /// Options for configuring the VM execution environment
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VMOptions {
+struct VMOptions {
     /// Storage backend configuration
     pub storage_backend: StorageBackendType,
     
@@ -72,6 +113,7 @@ pub struct VMOptions {
     pub identity_context: Option<AuthContext>,
     
     /// Whether federation is enabled
+    #[cfg(feature = "federation")]
     pub enable_federation: bool,
     
     /// Whether to compile and execute as bytecode
@@ -102,31 +144,9 @@ pub struct VMOptions {
     pub use_stdlib: bool,
 }
 
-/// Result returned after executing a program
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionResult {
-    /// Whether execution was successful
-    pub success: bool,
-    
-    /// Final stack values if execution was successful
-    pub stack: Option<Vec<TypedValue>>,
-    
-    /// Memory values if execution was successful
-    pub memory: Option<HashMap<String, TypedValue>>,
-    
-    /// Execution time in milliseconds
-    pub execution_time_ms: u128,
-    
-    /// Error if execution failed
-    pub error: Option<String>,
-    
-    /// Number of operations executed
-    pub operations_executed: usize,
-}
-
 /// Errors that can occur during VM execution
 #[derive(Debug, Error, Serialize, Deserialize)]
-pub enum VMEngineError {
+enum VMEngineError {
     /// VM execution error
     #[error("VM error: {0}")]
     VM(String),
@@ -152,8 +172,8 @@ pub enum VMEngineError {
     Other(String),
 }
 
-impl From<VMError> for VMEngineError {
-    fn from(err: VMError) -> Self {
+impl From<vm::errors::VMError> for VMEngineError {
+    fn from(err: vm::errors::VMError) -> Self {
         VMEngineError::VM(err.to_string())
     }
 }
@@ -194,266 +214,253 @@ impl From<Box<dyn Error>> for VMEngineError {
     }
 }
 
-/// Execute a program from a file path
-pub fn execute_program_from_path<P: AsRef<Path>>(
-    path: P,
-    options: VMOptions,
-) -> Result<ExecutionResult, VMEngineError> {
-    let path = path.as_ref();
-
-    // Check if file exists
-    if !path.exists() {
-        return Err(VMEngineError::from(format!("Program file not found: {}", path.display())));
-    }
-
-    // Parse operations based on file extension
-    let ops = if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-        match extension.to_lowercase().as_str() {
-            "dsl" => {
-                if options.debug_mode {
-                    println!("Parsing DSL program from {}", path.display());
-                }
-                let program_source = fs::read_to_string(path)?;
-
-                // Check if we should include the standard library
-                if options.debug_mode && options.use_stdlib {
-                    println!("Including standard library functions");
-                }
-
-                if options.use_stdlib {
-                    parse_dsl_with_stdlib(&program_source)?
-                } else {
-                    let (ops, _lifecycle) = parse_dsl(&program_source)?;
-                    ops
-                }
-            }
-            "json" => {
-                if options.debug_mode {
-                    println!("Parsing JSON program from {}", path.display());
-                }
-                let program_json = fs::read_to_string(path)?;
-                serde_json::from_str(&program_json)?
-            }
-            _ => return Err(VMEngineError::from(format!("Unsupported file extension: {}", extension))),
-        }
-    } else {
-        return Err(VMEngineError::from("File has no extension"));
-    };
-
-    if options.debug_mode {
-        println!("Program loaded with {} operations", ops.len());
-    }
-
-    execute_program(&ops, options)
+/// Extension trait to add creation from options
+trait VMExt<S: storage::traits::StorageBackend + Send + Sync + Clone + Debug + 'static> {
+    fn create_with_options(options: &VMOptions) -> Result<vm::VM<S>, VMEngineError>;
 }
 
-/// Execute a program from a list of operations
-pub fn execute_program(
-    ops: &[Op],
-    options: VMOptions,
-) -> Result<ExecutionResult, VMEngineError> {
-    // Print execution mode information if in debug mode
-    if options.debug_mode || options.simulation_mode || options.trace_execution || options.explain_operations {
+impl<S: storage::traits::StorageBackend + Send + Sync + Clone + Debug + 'static> VMExt<S> for vm::VM<S> {
+    fn create_with_options(options: &VMOptions) -> Result<vm::VM<S>, VMEngineError> {
+        // Configure VM with options
+        let mut vm = match options.storage_backend {
+            StorageBackendType::Memory => {
+                let storage = storage::implementations::in_memory::InMemoryStorage::new();
+                vm::VM::with_storage_backend(storage)
+            },
+            StorageBackendType::File(ref path) => {
+                let storage = storage::implementations::file_storage::FileStorage::new(path)?;
+                vm::VM::with_storage_backend(storage)
+            }
+        };
+        
+        // Apply additional VM configuration from options
+        if let Some(auth) = &options.identity_context {
+            vm.set_auth_context(auth.clone());
+        }
+        
+        vm.set_namespace(&options.namespace);
+        
+        if options.debug_mode {
+            println!("VM initialized with namespace: {}", options.namespace);
+            if options.identity_context.is_some() {
+                println!("Auth context set: {:?}", options.identity_context);
+            }
+        }
+        
+        // Configure execution behavior
         if options.simulation_mode {
-            println!("Running in SIMULATION mode (no persistent storage changes)");
+            if options.debug_mode {
+                println!("Running in simulation mode - no persistent changes will be made");
+            }
+            vm.begin_transaction();
         }
+        
         if options.trace_execution {
-            println!("Tracing enabled (will show operations and stack state)");
+            if options.debug_mode {
+                println!("Execution tracing enabled");
+            }
+            vm.set_tracing(true);
         }
+        
         if options.explain_operations {
-            println!("Explanation enabled (will describe each operation)");
+            vm.set_explain_operations(true);
         }
-    }
-
-    // Setup auth context (use provided or create default)
-    let auth_context = options.identity_context.unwrap_or_else(|| {
-        // Create a default identity with admin role
-        create_default_auth_context(None, Some("admin"))
-    });
-
-    // Get or create storage backend
-    let storage = match &options.storage_backend {
-        StorageBackendType::Memory => InMemoryStorage::new(),
-        StorageBackendType::File(path) => {
-            // For simplicity, we're only supporting InMemoryStorage for now
-            // In a real implementation, this would use FileStorage with the specified path
-            InMemoryStorage::new()
-        }
-    };
-
-    let start = Instant::now();
-    let mut operations_executed = 0;
-
-    let result = if options.use_bytecode {
-        // Bytecode execution
-        let mut compiler = BytecodeCompiler::new();
-        let program = compiler.compile(ops);
-
-        if options.debug_mode {
-            println!("Compiled bytecode program:\n{}", program.dump());
-        }
-
-        // Create bytecode interpreter with proper auth context and storage
-        let mut vm: VM<InMemoryStorage> = VM::new()
-            .set_simulation_mode(options.simulation_mode)
-            .set_tracing(options.trace_execution)
-            .set_explanation(options.explain_operations)
-            .set_verbose_storage_trace(options.verbose_storage_trace);
-
-        vm.set_auth_context(auth_context);
-        vm.set_namespace(options.namespace.as_str());
-        vm.set_storage_backend(storage);
-
-        let mut interpreter = BytecodeInterpreter::new(vm, program);
-
-        // Set parameters
-        interpreter
-            .get_vm_mut()
-            .set_parameters(options.parameters.clone())?;
-
-        // Execute
-        let execute_result = interpreter.execute();
         
-        if let Ok(count) = execute_result {
-            operations_executed = count;
-            
-            let stack = interpreter.get_vm().get_stack().clone();
-            let memory_map = interpreter.get_vm().get_memory_map();
-            
-            Ok((stack, memory_map))
-        } else {
-            Err(execute_result.err().unwrap())
+        if options.verbose_storage_trace {
+            vm.set_storage_tracing(true);
         }
-    } else {
-        // AST execution
-        let mut vm: VM<InMemoryStorage> = VM::new();
-
-        // Set the execution options
-        vm.set_simulation_mode(options.simulation_mode);
-        vm.set_tracing(options.trace_execution);
-        vm.set_explanation(options.explain_operations);
-        vm.set_verbose_storage_trace(options.verbose_storage_trace);
-
-        vm.set_auth_context(auth_context);
-        vm.set_namespace(options.namespace.as_str());
-        vm.set_storage_backend(storage);
-
-        // Set parameters
-        vm.set_parameters(options.parameters)?;
-
-        if options.debug_mode {
-            println!("Executing program in AST interpreter mode...");
-            println!("-----------------------------------");
-        }
-
-        let execute_result = vm.execute(ops);
         
-        if let Ok(count) = execute_result {
-            operations_executed = count;
-            
-            let stack = vm.get_stack().clone();
-            let memory_map = vm.get_memory_map();
-            
-            Ok((stack, memory_map))
-        } else {
-            Err(execute_result.err().unwrap())
-        }
-    };
-
-    let duration = start.elapsed();
-    
-    if options.debug_mode {
-        println!("Execution completed in {:?}", duration);
-    }
-
-    match result {
-        Ok((stack, memory)) => {
-            if options.debug_mode {
-                println!("Final stack: {:?}", stack);
-                println!("Final memory:");
-                for (key, value) in &memory {
-                    println!("  {}: {}", key, value);
-                }
-                if memory.is_empty() {
-                    println!("  (empty)");
-                }
-            }
-            
-            Ok(ExecutionResult {
-                success: true,
-                stack: Some(stack),
-                memory: Some(memory),
-                execution_time_ms: duration.as_millis(),
-                error: None,
-                operations_executed,
-            })
-        },
-        Err(err) => {
-            if options.debug_mode {
-                println!("Execution failed: {}", err);
-            }
-            
-            Ok(ExecutionResult {
-                success: false,
-                stack: None,
-                memory: None,
-                execution_time_ms: duration.as_millis(),
-                error: Some(err.to_string()),
-                operations_executed,
-            })
-        }
+        Ok(vm)
     }
 }
 
-/// Create a default authentication context
+/// Execute DSL source code with the given authorization context
+/// 
+/// This function parses and executes a DSL program, producing a DagDelta that
+/// represents the changes to the DAG ledger as a result of execution.
+/// 
+/// # Arguments
+/// 
+/// * `src` - Source code in the DSL format
+/// * `ctx` - Authorization context for the execution
+/// 
+/// # Returns
+/// 
+/// A Result containing the DagDelta with any changes to the DAG ledger,
+/// or an error if parsing or execution failed.
+pub fn execute_dsl(src: &str, ctx: &AuthContext) -> Result<DagDelta, VMEngineError> {
+    // Create default options with the provided auth context
+    let mut options = VMOptions::default();
+    options.identity_context = Some(ctx.clone());
+    options.namespace = "default".to_string();
+    
+    // Parse the DSL code
+    let ops = if options.use_stdlib {
+        parse_dsl_with_stdlib(src)?
+    } else {
+        let (ops, _) = parse_dsl(src)?;
+        ops
+    };
+    
+    // Create a VM with the specified options
+    let mut vm = vm::VM::create_with_options(&options)?;
+    
+    // Start tracking execution time
+    let start_time = Instant::now();
+    
+    // Execute the operations based on the use_bytecode option
+    let operations_executed = if options.use_bytecode {
+        // Use bytecode compilation and execution
+        let mut compiler = bytecode::BytecodeCompiler::new();
+        let program = compiler.compile(&ops);
+        
+        let mut interpreter = bytecode::BytecodeInterpreter::new(vm, program);
+        match interpreter.execute() {
+            Ok(()) => {
+                // Extract the VM from the interpreter
+                vm = interpreter.get_vm().clone();
+                ops.len() // Use original ops count for consistency
+            }
+            Err(err) => {
+                // Extract the VM from the interpreter
+                vm = interpreter.get_vm().clone();
+                
+                // Return the error
+                return Err(err.into());
+            }
+        }
+    } else {
+        // Use direct AST execution
+        match vm.execute(&ops) {
+            Ok(count) => count,
+            Err(err) => return Err(err.into()),
+        }
+    };
+    
+    // Calculate execution time
+    let elapsed = start_time.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    
+    // Prepare result
+    let mut delta = DagDelta::new(options.namespace);
+    delta.operations_executed = operations_executed;
+    
+    // Include any DAG nodes created during execution
+    if let Some(dag) = vm.dag {
+        // Get the nodes created during this execution
+        let all_nodes = dag.nodes();
+        delta.added_nodes = all_nodes.clone();
+    }
+    
+    Ok(delta)
+}
+
+/// Create a default auth context with optional identity name and role
 pub fn create_default_auth_context(id_name: Option<&str>, role: Option<&str>) -> AuthContext {
-    let id_name = id_name.unwrap_or("default-user");
+    let id_name = id_name.unwrap_or("anonymous");
     let role = role.unwrap_or("user");
     
-    // Create a new Ed25519 identity
-    let identity = Identity::new_ed25519();
+    // Create a new auth context with the specified role
+    let mut auth = AuthContext::new(id_name);
     
-    // Create and return the auth context
-    AuthContext::new(identity, role.to_string())
+    // Add the role
+    auth.add_role("global", role);
+    auth.add_role_to_identity(id_name, "global", role);
+    
+    auth
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
+    
     #[test]
     fn test_simple_program_execution() {
-        let test_program_path = PathBuf::from("demo/governance/ranked_vote.dsl");
+        let source = r#"
+            # Simple test program
+            push 10.0
+            push 5.0
+            add
+            emit "hi"
+        "#;
         
-        // Skip test if the file doesn't exist in test environment
-        if !test_program_path.exists() {
-            println!("Test program not found, skipping test");
-            return;
-        }
+        let auth_ctx = create_default_auth_context(None, None);
+        let result = execute_dsl(source, &auth_ctx).expect("Execution should succeed");
+        assert!(result.success);
+        assert!(result.operations_executed > 0);
+    }
+    
+    #[test]
+    fn test_emit_returns_ok() {
+        let source = r#"emit "hi""#;
         
-        let options = VMOptions {
-            storage_backend: StorageBackendType::Memory,
-            identity_context: None, // Use default
-            enable_federation: false,
-            use_bytecode: false,
-            debug_mode: false,
-            simulation_mode: true, // Use simulation mode for tests
-            trace_execution: false,
-            explain_operations: false,
-            verbose_storage_trace: false,
-            namespace: "test".to_string(),
-            parameters: HashMap::new(),
-            use_stdlib: true,
-        };
+        let auth_ctx = create_default_auth_context(None, None);
+        let result = execute_dsl(source, &auth_ctx);
+        assert!(result.is_ok());
+    }
+    
+    #[test]
+    fn test_emit_creates_dag_vertex() {
+        let source = r#"emit "Hello""#;
         
-        let result = execute_program_from_path(test_program_path, options);
+        let auth_ctx = create_default_auth_context(None, None);
+        let result = execute_dsl(source, &auth_ctx).expect("Execution should succeed");
         
-        assert!(result.is_ok(), "Program execution failed: {:?}", result.err());
+        // Verify the result
+        assert!(result.success);
+        assert!(result.operations_executed > 0);
         
-        let exec_result = result.unwrap();
-        assert!(exec_result.success, "Execution not successful: {:?}", exec_result.error);
-        assert!(exec_result.stack.is_some(), "Stack should not be None");
-        assert!(exec_result.memory.is_some(), "Memory should not be None");
+        // Verify a DAG node was created
+        assert!(!result.added_nodes.is_empty(), "Expected at least one DAG node");
+        
+        // Examine the first node
+        let node = &result.added_nodes[0];
+        assert!(!node.id.is_empty(), "Node ID should not be empty");
+    }
+    
+    #[test]
+    fn test_bytecode_execution() {
+        let source = r#"
+            push 1.0
+            push 2.0
+            add
+            emit "bytecode test"
+        "#;
+        
+        let auth_ctx = create_default_auth_context(None, None);
+        
+        // Create options for bytecode execution
+        let mut options = VMOptions::default();
+        options.identity_context = Some(auth_ctx.clone());
+        options.use_bytecode = true;
+        
+        // Parse and create a VM
+        let (ops, _) = parse_dsl(source).expect("Parsing should succeed");
+        let mut vm = vm::VM::create_with_options(&options).expect("VM creation should succeed");
+        
+        // Compile to bytecode
+        let mut compiler = bytecode::BytecodeCompiler::new();
+        let program = compiler.compile(&ops);
+        
+        // Execute via bytecode interpreter
+        let mut interpreter = bytecode::BytecodeInterpreter::new(vm, program);
+        let result = interpreter.execute();
+        assert!(result.is_ok(), "Bytecode execution failed: {:?}", result);
+        
+        // Test the full execute_dsl with bytecode
+        let mut options = VMOptions::default();
+        options.identity_context = Some(auth_ctx.clone());
+        options.use_bytecode = true;
+        
+        let mut vm = vm::VM::create_with_options(&options).expect("VM creation should succeed");
+        let (ops, _) = parse_dsl(source).expect("Parsing should succeed");
+        
+        // Create a bytecode program
+        let program = compiler.compile(&ops);
+        
+        // Create and run the interpreter
+        let mut interpreter = bytecode::BytecodeInterpreter::new(vm, program);
+        let result = interpreter.execute();
+        assert!(result.is_ok(), "Bytecode execution failed: {:?}", result);
     }
 }

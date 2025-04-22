@@ -242,13 +242,34 @@ impl TypedValue {
         Ok(TypedValue::Boolean(a || b))
     }
 
-    /// Returns a human-readable description of the TypedValue for debugging
+    /// Detailed string representation of the value for debugging/tracing
     pub fn describe(&self) -> String {
         match self {
-            TypedValue::Number(n) => format!("Number({})", n),
+            TypedValue::Number(n) => {
+                // Format integers without decimal point, use scientific notation for large numbers
+                if n.fract() == 0.0 && n.abs() < 1_000_000.0 {
+                    format!("Number({})", n.trunc() as i64)
+                } else if n.abs() > 1_000_000.0 || n.abs() < 0.0001 {
+                    format!("Number({:e})", n)
+                } else {
+                    // Use precision based on the decimal places
+                    let precision = if n.fract() == 0.0 { 0 } else { 6 };
+                    format!("Number({:.precision$})", n, precision = precision)
+                }
+            }
             TypedValue::Boolean(b) => format!("Boolean({})", b),
-            TypedValue::String(s) => format!("String(\"{}\")", s),
-            TypedValue::Null => "Null".into(),
+            TypedValue::String(s) => {
+                // Escape special characters and handle multi-line strings
+                if s.contains('\n') {
+                    format!("String(\n'''\n{}\n''')", s)
+                } else if s.len() > 80 {
+                    // Truncate long strings
+                    format!("String(\"{}...\" [{} chars])", &s[..77], s.len())
+                } else {
+                    format!("String(\"{}\")", s)
+                }
+            }
+            TypedValue::Null => "Null".to_string(),
         }
     }
 

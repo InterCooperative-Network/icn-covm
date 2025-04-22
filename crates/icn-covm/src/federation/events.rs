@@ -45,4 +45,13 @@ pub enum NetworkEvent {
 
     /// Error occurred in the network layer
     Error(String),
+    
+    /// Signal to retry a network operation
+    RetryOperation {
+        /// The type of operation to retry
+        operation: String,
+        
+        /// The target of the operation (e.g., peer id, address)
+        target: String,
+    },
 }

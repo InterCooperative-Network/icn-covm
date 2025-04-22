@@ -166,6 +166,35 @@ pub fn federation_command() -> Command {
                         .help("Filter by status: open, closed, executed, rejected, expired"),
                 ),
         )
+        .subcommand(
+            Command::new("status")
+                .about("Show the status of the federation node")
+        )
+        .subcommand(
+            Command::new("peers")
+                .about("List connected peers in the federation network")
+                .arg(
+                    Arg::new("verbose")
+                        .long("verbose")
+                        .short('v')
+                        .help("Show more detailed peer information")
+                        .action(ArgAction::SetTrue),
+                )
+        )
+        .subcommand(
+            Command::new("send-msg")
+                .about("Send a message to a specific peer")
+                .arg(
+                    Arg::new("peer")
+                        .help("The peer ID or multiaddress to send the message to")
+                        .required(true)
+                )
+                .arg(
+                    Arg::new("json")
+                        .help("The JSON message to send")
+                        .required(true)
+                )
+        )
 }
 
 /// Handle federation commands
@@ -310,6 +339,22 @@ where
                 .get_one::<String>("status")
                 .map(|s| s.to_string());
             list_federated_proposals(vm, status_filter, auth_context)
+        }
+        Some(("status", _)) => {
+            display_federation_status(vm).await?;
+        }
+        Some(("peers", sub_matches)) => {
+            let verbose = sub_matches.get_flag("verbose");
+            list_federation_peers(vm, verbose).await?;
+        }
+        Some(("send-msg", sub_matches)) => {
+            let peer = sub_matches
+                .get_one::<String>("peer")
+                .ok_or_else(|| "Missing required argument: peer")?;
+            let json_msg = sub_matches
+                .get_one::<String>("json")
+                .ok_or_else(|| "Missing required argument: json")?;
+            send_federation_message(vm, peer, json_msg, auth_context).await?;
         }
         _ => Err("Unknown federation subcommand".into()),
     }
@@ -874,4 +919,191 @@ where
     }
 
     Ok(())
+}
+
+/// Display the status of the federation node
+async fn display_federation_status<S>(vm: &VM<S>) -> Result<(), Box<dyn Error>>
+where
+    S: Storage + StorageExtensions + Send + Sync + Clone + Debug + 'static,
+{
+    // Get the network node from the VM
+    let node = vm.get_network_node().ok_or_else(|| {
+        "Federation node is not initialized. Run with --federation flag to enable federation."
+            .to_string()
+    })?;
+
+    // Get the node's status
+    let local_peer_id = node.local_peer_id();
+    let connected_peers = node.connected_peers().await;
+    let listen_addrs = node.listen_addresses().await;
+    
+    println!("Federation Node Status:");
+    println!("----------------------");
+    println!("Local Peer ID: {}", local_peer_id);
+    println!("Connected Peers: {}", connected_peers.len());
+    println!("Listening on:");
+    for addr in listen_addrs {
+        println!("  - {}", addr);
+    }
+    
+    // Get node uptime if available
+    if let Some(start_time) = node.get_start_time() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let uptime_seconds = now.saturating_sub(start_time);
+        let days = uptime_seconds / 86400;
+        let hours = (uptime_seconds % 86400) / 3600;
+        let minutes = (uptime_seconds % 3600) / 60;
+        let seconds = uptime_seconds % 60;
+        
+        println!("Uptime: {}d {}h {}m {}s", days, hours, minutes, seconds);
+    }
+    
+    // Display node role if available
+    if let Some(role) = node.get_role() {
+        println!("Node Role: {}", role);
+    }
+    
+    // Show federation storage status
+    println!("Federation Storage:");
+    println!("  Proposals: {}", vm.count_federated_proposals()?);
+    println!("  Votes: {}", vm.count_federated_votes()?);
+    
+    Ok(())
+}
+
+/// List connected peers in the federation network
+async fn list_federation_peers<S>(vm: &VM<S>, verbose: bool) -> Result<(), Box<dyn Error>>
+where
+    S: Storage + StorageExtensions + Send + Sync + Clone + Debug + 'static,
+{
+    // Get the network node from the VM
+    let node = vm.get_network_node().ok_or_else(|| {
+        "Federation node is not initialized. Run with --federation flag to enable federation."
+            .to_string()
+    })?;
+
+    // Get connected peers information
+    let peers = node.connected_peers().await;
+    
+    if peers.is_empty() {
+        println!("No connected peers found.");
+        return Ok(());
+    }
+    
+    println!("Connected Peers ({})", peers.len());
+    println!("----------------");
+    
+    for (i, peer_info) in peers.iter().enumerate() {
+        println!("{}. Peer ID: {}", i + 1, peer_info.peer_id);
+        
+        if verbose {
+            if let Some(addresses) = &peer_info.addresses {
+                println!("   Addresses:");
+                for addr in addresses {
+                    println!("     - {}", addr);
+                }
+            }
+            
+            if let Some(role) = &peer_info.role {
+                println!("   Role: {}", role);
+            }
+            
+            if let Some(ping) = peer_info.ping_ms {
+                println!("   Ping: {}ms", ping);
+            }
+            
+            if let Some(protocols) = &peer_info.supported_protocols {
+                println!("   Supported Protocols:");
+                for protocol in protocols {
+                    println!("     - {}", protocol);
+                }
+            }
+            
+            if let Some(last_seen) = peer_info.last_seen {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let seconds_ago = now.saturating_sub(last_seen);
+                
+                if seconds_ago < 60 {
+                    println!("   Last Seen: {} seconds ago", seconds_ago);
+                } else if seconds_ago < 3600 {
+                    println!("   Last Seen: {} minutes ago", seconds_ago / 60);
+                } else {
+                    println!("   Last Seen: {} hours ago", seconds_ago / 3600);
+                }
+            }
+            
+            println!(); // Add blank line between peers for readability
+        }
+    }
+    
+    Ok(())
+}
+
+/// Send a message to a specific peer
+async fn send_federation_message<S>(
+    vm: &VM<S>,
+    peer: &str, 
+    json_msg: &str,
+    auth_context: &AuthContext,
+) -> Result<(), Box<dyn Error>>
+where
+    S: Storage + StorageExtensions + Send + Sync + Clone + Debug + 'static,
+{
+    // Get the network node from the VM
+    let node = vm.get_network_node().ok_or_else(|| {
+        "Federation node is not initialized. Run with --federation flag to enable federation."
+            .to_string()
+    })?;
+    
+    // Parse the peer address or ID
+    let peer_target = if peer.starts_with("/ip4/") || peer.starts_with("/ip6/") {
+        // It's a multiaddress
+        let addr: Multiaddr = peer.parse().map_err(|_| format!("Invalid multiaddress: {}", peer))?;
+        peer.to_string()
+    } else {
+        // Assume it's a peer ID
+        format!("{}", peer)
+    };
+    
+    // Parse the JSON message
+    let json_value: serde_json::Value = serde_json::from_str(json_msg)
+        .map_err(|e| format!("Invalid JSON message: {}", e))?;
+    
+    // Send the message
+    println!("Sending message to peer {}...", peer_target);
+    
+    let result = node.send_custom_message(&peer_target, json_value).await;
+    
+    match result {
+        Ok(_) => {
+            println!("Message sent successfully.");
+            
+            // Log the message in local storage for audit purposes
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            
+            let log_entry = serde_json::json!({
+                "type": "outgoing_message",
+                "timestamp": timestamp,
+                "peer": peer,
+                "message": json_value,
+                "sender": auth_context.identity.id_string(),
+            });
+            
+            vm.federation_log_message(log_entry, auth_context)?;
+            
+            Ok(())
+        },
+        Err(e) => {
+            Err(format!("Failed to send message: {}", e).into())
+        }
+    }
 }

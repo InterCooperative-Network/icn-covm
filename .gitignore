@@ -37,3 +37,5 @@ full_project_dump.txt
 # Storage files
 /filestorage/
 /storage/
+*.dump.txt
+icn-covm_dump_*.txt
